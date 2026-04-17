@@ -311,6 +311,10 @@ class Logger:
         self.log(message)
 
     def prompt_input(self, message: str) -> str:
+        if not sys.stdin.isatty():
+            raise PaperScriptError(
+                "A prompt was required, but no interactive terminal is available. Re-run with --yes or adjust config."
+            )
         return input(color_text(message, ANSI_MAGENTA, self.use_color, bold=True))
 
 
@@ -460,7 +464,11 @@ class PaperScriptApp:
         self.backups_dir = self.runtime_dir / str(self.config["backup_dir"])
         self.downloads_dir = self.runtime_dir / str(self.config["downloads_dir"])
         self.log_path = self.runtime_dir / str(self.config["log_file"])
-        self.logger = Logger(self.log_path, quiet=False, use_color=supports_color(sys.stdout, no_color=bool(args.no_color)))
+        self.logger = Logger(
+            self.log_path,
+            quiet=bool(args.quiet),
+            use_color=supports_color(sys.stdout, no_color=bool(args.no_color)),
+        )
         ensure_directory(self.backups_dir)
         ensure_directory(self.downloads_dir)
         self.state = self._load_json(self.state_path)
@@ -1276,6 +1284,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--dry-run",
         action="store_true",
         help="Show what PaperScript would do without changing files or stopping servers.",
+    )
+    parser.add_argument(
+        "--quiet",
+        action="store_true",
+        help="Suppress normal console output. Useful for cron or scheduled tasks; logs still go to logs.log.",
     )
     parser.add_argument(
         "--no-color",
