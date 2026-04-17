@@ -500,7 +500,7 @@ class PaperScriptApp:
     def force_example_for_current(self, current: JarInfo | None) -> str | None:
         if current is None:
             return None
-        return f"./paperscript --force download --version {current.version} --build {current.build}"
+        return f"./paperscript.sh --force download --version {current.version} --build {current.build}"
 
     def _resolve_server_dir(self) -> Path:
         if self.args.server_dir:
@@ -743,7 +743,7 @@ class PaperScriptApp:
                 "No newer stable build is available, so no download was performed."
             )
             self.logger.log("If you want to re-download this jar anyway, run one of these:")
-            self.logger.log("  ./paperscript --force update")
+            self.logger.log("  ./paperscript.sh --force update")
             exact_force = self.force_example_for_current(current)
             if exact_force:
                 self.logger.log(f"  {exact_force}")
@@ -1223,7 +1223,7 @@ class PaperScriptApp:
             f"Latest experimental release overall: {latest_experimental_version} build #{latest_experimental_build.build_id}"
         )
         self.logger.log(
-            f"Use './paperscript experimental' to inspect it, or './paperscript experimental --download' to install it."
+            "Use './paperscript.sh experimental' to inspect it, or './paperscript.sh experimental --download' to install it."
         )
         self.logger.log(
             f"Backup retention: keep {self.keep_backups} backups, cleanup after install {format_bool(self.cleanup_backups_after_install)}"
@@ -1237,7 +1237,7 @@ class PaperScriptApp:
         self.logger.log(f"Download URL: {build.download_url}")
         if build.sha256:
             self.logger.log(f"Expected SHA-256: {build.sha256}")
-        self.logger.log(f"Exact manual command: ./paperscript download --version {version} --channel ALPHA")
+        self.logger.log(f"Exact manual command: ./paperscript.sh download --version {version} --channel ALPHA")
         if download:
             self.install_build(build, force_version_prompt=True)
 
@@ -1409,7 +1409,7 @@ def timestamp_for_filename() -> str:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        prog="paperscript.py",
+        prog="paperscript.sh",
         description="Download and upgrade Paper server jars through the Fill v3 API.",
         epilog=(
             f"Project and examples: {PROJECT_URL}\n"
