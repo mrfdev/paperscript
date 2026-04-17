@@ -24,9 +24,10 @@ from urllib.request import Request, urlopen
 APP_NAME = "PaperScript"
 APP_VERSION = "0.1.0"
 API_ROOT = "https://fill.papermc.io/v3/projects/paper"
+PROJECT_URL = "https://github.com/mrfdev/PaperScript"
 DEFAULT_CHANNEL = "STABLE"
 DEFAULT_TIMEOUT = 30
-DEFAULT_USER_AGENT = "mrfloris-PaperScript/2.0 (https://github.com/mrfdev/PaperScript)"
+DEFAULT_USER_AGENT = f"mrfloris-PaperScript/2.0 ({PROJECT_URL})"
 CURRENT_JAR_PATTERN = re.compile(r"^paper-(.+)-(\d+)\.jar$", re.IGNORECASE)
 DEFAULT_CONFIG: dict[str, Any] = {
     "server_name": None,
@@ -88,6 +89,12 @@ class BuildInfo:
     @property
     def filename(self) -> str:
         return f"Paper-{self.version}-{self.build_id}.jar"
+
+
+@dataclass
+class DownloadVerification:
+    sha256: str
+    bytes_written: int
 
 
 def utc_now() -> str:
@@ -183,13 +190,16 @@ def ensure_directory(path: Path) -> None:
 
 
 def run_command(args: list[str]) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(
-        args,
-        check=False,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-    )
+    try:
+        return subprocess.run(
+            args,
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+    except (PermissionError, FileNotFoundError) as error:
+        return subprocess.CompletedProcess(args, returncode=1, stdout="", stderr=str(error))
 
 
 def format_bytes(size: int | None) -> str:
@@ -206,6 +216,17 @@ def format_bytes(size: int | None) -> str:
 
 def format_bool(value: bool) -> str:
     return "yes" if value else "no"
+
+
+def sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        while True:
+            chunk = handle.read(1024 * 1024)
+            if not chunk:
+                break
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 class Logger:
@@ -315,10 +336,17 @@ class PaperAPI:
                 return build
         return None
 
-    def download_file(self, build: BuildInfo, destination: Path) -> None:
+    def get_build_by_id(self, version: str, build_id: int) -> BuildInfo | None:
+        for build in self.get_builds(version):
+            if build.build_id == build_id:
+                return build
+        return None
+
+    def download_file(self, build: BuildInfo, destination: Path) -> DownloadVerification:
         ensure_directory(destination.parent)
         request = Request(build.download_url, headers={"User-Agent": self.user_agent})
         sha256 = hashlib.sha256()
+        bytes_written = 0
         try:
             with urlopen(request, timeout=self.timeout) as response, destination.open("wb") as handle:
                 while True:
@@ -326,6 +354,7 @@ class PaperAPI:
                     if not chunk:
                         break
                     sha256.update(chunk)
+                    bytes_written += len(chunk)
                     handle.write(chunk)
         except HTTPError as error:
             detail = error.read().decode("utf-8", errors="ignore") if hasattr(error, "read") else ""
@@ -339,6 +368,9 @@ class PaperAPI:
                 raise PaperScriptError(
                     f"Checksum mismatch for {build.filename}: expected {build.sha256}, got {digest}"
                 )
+            return DownloadVerification(sha256=digest, bytes_written=bytes_written)
+
+        return DownloadVerification(sha256=sha256.hexdigest(), bytes_written=bytes_written)
 
 
 def guess_version_group(version: str) -> str:
@@ -439,7 +471,7 @@ class PaperScriptApp:
 
         return DEFAULT_USER_AGENT
 
-    def record_state(self, build: BuildInfo, installed_path: Path) -> None:
+    def record_state(self, build: BuildInfo, installed_path: Path, current_sha256: str) -> None:
         self.state.update(
             {
                 "current_build": build.build_id,
@@ -447,6 +479,9 @@ class PaperScriptApp:
                 "current_version": build.version,
                 "installed_at": utc_now(),
                 "server_dir": str(self.server_dir),
+                "expected_sha256": build.sha256,
+                "current_sha256": current_sha256,
+                "download_url": build.download_url,
             }
         )
         self._save_json(self.state_path, self.state)
@@ -598,16 +633,22 @@ class PaperScriptApp:
                     f"Latest stable build is #{latest_build.build_id}."
                 )
                 return latest_build
+            if latest_build.build_id == current.build and self.args.force:
+                self.logger.log(
+                    f"Current server is already on {current.version} build #{current.build}, "
+                    "but --force was supplied, so PaperScript will re-download and reinstall the latest stable build."
+                )
+                return latest_build
             self.logger.log(
                 f"Current server is already on {current.version} build #{current.build}. "
-                "No newer stable build is available."
+                "No newer stable build is available, so no download was performed."
             )
             return None
 
         if version_cmp > 0:
             self.logger.log(
                 f"Current server version {current.version} is newer than the latest stable version "
-                f"this script found ({latest_version}). Nothing will be changed automatically."
+                f"this script found ({latest_version}). No download was performed automatically."
             )
             return None
 
@@ -629,6 +670,7 @@ class PaperScriptApp:
         ):
             return latest_build
         self.logger.log("Skipped version upgrade by choice.")
+        self.logger.log("No download was performed.")
         return None
 
     def ensure_safe_to_upgrade(self) -> None:
@@ -857,6 +899,8 @@ class PaperScriptApp:
     def print_dry_run_summary(self, target_path: Path, current: JarInfo | None, build: BuildInfo) -> None:
         self.logger.log("Dry run: no files were changed.")
         self.logger.log(f"Dry run: would download {build.download_url}")
+        if build.sha256:
+            self.logger.log(f"Dry run: expected SHA-256 from API is {build.sha256}")
         self.logger.log(f"Dry run: would stage the jar in {self.downloads_dir}")
         if current:
             self.logger.log(f"Dry run: would back up {current.path.name} into {self.backups_dir}")
@@ -931,24 +975,31 @@ class PaperScriptApp:
             f"({build.channel}, {format_bytes(build.size)})..."
         )
         try:
-            self.api.download_file(build, temp_path)
+            verification = self.api.download_file(build, temp_path)
         except Exception:
             if temp_path.exists():
                 temp_path.unlink()
             raise
         temp_path.rename(final_temp)
         self.logger.log(f"Downloaded to {final_temp}")
+        if build.sha256:
+            self.logger.log(f"Expected SHA-256: {build.sha256}")
+        self.logger.log(f"Downloaded SHA-256: {verification.sha256}")
+        self.logger.log(
+            f"Checksum verification: {'match' if not build.sha256 or verification.sha256.lower() == build.sha256.lower() else 'mismatch'}"
+        )
 
         self.backup_existing_jar(current, target_name)
         shutil.move(str(final_temp), str(target_path))
         self.logger.log(f"Installed {target_path}")
-        self.record_state(build, target_path)
+        self.record_state(build, target_path, verification.sha256)
         self.prune_old_backups()
 
     def run_update(self) -> None:
         self.describe_server_context()
         target = self.choose_target_for_update()
         if target is None:
+            self.logger.log("Update finished with no download or install changes.")
             return
         self.install_build(target, force_version_prompt=False)
 
@@ -987,6 +1038,15 @@ class PaperScriptApp:
             self.logger.log(
                 f"Current jar: {current.path.name} (version {current.version}, build #{current.build})"
             )
+            current_sha = sha256_file(current.path)
+            self.logger.log(f"Current jar SHA-256: {current_sha}")
+            expected_sha = self.state.get("expected_sha256")
+            state_jar = self.state.get("current_jar")
+            if expected_sha and state_jar == current.path.name:
+                self.logger.log(f"Expected SHA-256 from last install: {expected_sha}")
+                self.logger.log(
+                    f"Current SHA-256 matches expected: {format_bool(current_sha.lower() == str(expected_sha).lower())}"
+                )
         else:
             self.logger.log("Current jar: none")
 
@@ -1026,6 +1086,58 @@ class PaperScriptApp:
             f"Backup retention: keep {self.keep_backups} backups, cleanup after install {format_bool(self.cleanup_backups_after_install)}"
         )
 
+    def run_verify(self) -> None:
+        current = self.find_current_jar()
+        if not current:
+            raise PaperScriptError("No current Paper jar was detected to verify.")
+
+        current_sha = sha256_file(current.path)
+        self.logger.log(
+            f"Verify target: {current.path.name} (version {current.version}, build #{current.build})"
+        )
+        self.logger.log(f"Current SHA-256: {current_sha}")
+
+        state_jar = self.state.get("current_jar")
+        state_expected = self.state.get("expected_sha256")
+        state_current = self.state.get("current_sha256")
+        if state_jar == current.path.name:
+            if not state_current and not state_expected:
+                self.logger.log("Recorded install state exists for this jar, but it does not contain stored SHA-256 values yet.")
+            if state_current:
+                self.logger.log(f"Recorded SHA-256 from install time: {state_current}")
+                self.logger.log(
+                    f"Current SHA-256 matches recorded install SHA: "
+                    f"{format_bool(current_sha.lower() == str(state_current).lower())}"
+                )
+            if state_expected:
+                self.logger.log(f"Recorded expected SHA-256: {state_expected}")
+                self.logger.log(
+                    f"Current SHA-256 matches recorded expected SHA: "
+                    f"{format_bool(current_sha.lower() == str(state_expected).lower())}"
+                )
+        else:
+            self.logger.log("Recorded install state does not match the currently detected jar, so local state comparison is unavailable.")
+
+        api_build: BuildInfo | None = None
+        try:
+            api_build = self.api.get_build_by_id(current.version, current.build)
+        except PaperScriptError as error:
+            self.logger.log(f"API checksum lookup unavailable: {error}")
+
+        if api_build is None:
+            self.logger.log("API checksum verification: unavailable for this jar or the API could not be reached.")
+            return
+
+        self.logger.log(f"API download URL: {api_build.download_url}")
+        if api_build.sha256:
+            self.logger.log(f"API expected SHA-256: {api_build.sha256}")
+            self.logger.log(
+                f"Current SHA-256 matches API expected SHA: "
+                f"{format_bool(current_sha.lower() == api_build.sha256.lower())}"
+            )
+        else:
+            self.logger.log("API checksum verification: this build did not include a SHA-256 in the API response.")
+
 
 def timestamp_for_filename() -> str:
     return datetime.now().strftime("%Y%m%d-%H%M%S")
@@ -1035,6 +1147,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="paperscript.py",
         description="Download and upgrade Paper server jars through the Fill v3 API.",
+        epilog=(
+            f"Project and examples: {PROJECT_URL}\n"
+            "Use 'update' for the latest stable release, or 'download --version ... --build ...' for an exact jar."
+        ),
     )
     parser.add_argument("--server-dir", help="Target server directory. Defaults to the current directory.")
     parser.add_argument(
@@ -1063,7 +1179,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--force",
         action="store_true",
-        help="Force reinstall even if the same or a newer build is already present.",
+        help="Force reinstall even if the same build is already present. Useful with update or download.",
     )
     parser.add_argument(
         "--dry-run",
@@ -1080,6 +1196,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="Show what PaperScript would do without changing files or stopping servers.",
     )
     subparsers.add_parser("status", help="Show current server state and whether an update is available.")
+    subparsers.add_parser("verify", help="Verify the current jar SHA-256 against recorded state and the live API when available.")
 
     list_parser = subparsers.add_parser("list-versions", help="List versions available from the API.")
     list_parser.add_argument(
@@ -1124,6 +1241,8 @@ def main() -> int:
             app.run_update()
         elif args.command == "status":
             app.run_status()
+        elif args.command == "verify":
+            app.run_verify()
         elif args.command == "list-versions":
             app.list_versions(show_channels=args.channels)
         elif args.command == "inspect":

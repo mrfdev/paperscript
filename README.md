@@ -38,7 +38,9 @@ Bash is still useful here as a tiny wrapper, but Python is much more maintainabl
 - Prompts before moving from one Minecraft version to a newer one.
 - Lets you force a specific version or exact build download.
 - Adds a `status` command to show the current state and whether an update is available.
+- Adds a `verify` command to hash the current jar and compare it with recorded and API-reported SHA-256 values.
 - Adds a `--dry-run` mode so you can preview actions without changing files.
+- Verifies the downloaded jar against the API-provided SHA-256 checksum before install.
 - Backs up the current Paper jar before installing a new one.
 - Installs jars using a consistent `Paper-<version>-<build>.jar` filename.
 - Keeps only the newest 10 backups by default after successful installs.
@@ -84,6 +86,7 @@ Behavior:
 
 - If no current `Paper-<version>-<build>.jar` exists, it offers the latest stable build.
 - If the current version matches the latest stable version, it only downloads when the build number is newer.
+- If the current version and build already match the latest stable release, `--force update` re-downloads and reinstalls that same latest stable jar.
 - If the latest stable version is newer than your current version, it asks before upgrading versions.
 - If `server.properties` exists and a matching Java process appears to be running, it asks how to proceed.
 - If `--dry-run` is used, it reports what it would do without stopping the server or changing files.
@@ -93,6 +96,7 @@ Examples:
 ```bash
 ./paperscript
 ./paperscript update
+./paperscript --force update
 ./paperscript update --dry-run
 ./paperscript --server-dir /srv/mc/live update
 ./paperscript --yes update
@@ -105,12 +109,14 @@ Shows the current local Paper state plus the latest stable release info from the
 It reports:
 
 - current jar version and build
+- current jar SHA-256
 - whether `server.properties` exists
 - configured server port
 - whether a likely Java server process is running
 - latest stable version and build
 - whether an update is available
 - latest channel info for the newest version
+- expected SHA-256 from the last PaperScript install, when available
 - backup retention settings
 
 Examples:
@@ -118,6 +124,22 @@ Examples:
 ```bash
 ./paperscript status
 ./paperscript --server-dir /srv/mc/live status
+```
+
+### `verify`
+
+Hashes the current installed jar and compares it against:
+
+- the SHA-256 recorded in `state.json` during the last PaperScript install, when available
+- the expected SHA-256 from the live Paper API for that exact version and build, when available
+
+This is useful if you want a quick integrity check after download or later on before starting a server.
+
+Examples:
+
+```bash
+./paperscript verify
+./paperscript --server-dir /srv/mc/live verify
 ```
 
 ### `list-versions`
@@ -174,6 +196,7 @@ Examples:
 ./paperscript download --version 1.20.4 --build 123
 ./paperscript download --version 26.2.1 --channel BETA
 ./paperscript --force download --version 26.1.2
+./paperscript --force download --version 1.21.1 --build 130
 ```
 
 Notes:
@@ -182,6 +205,9 @@ Notes:
 - `--build` downloads that exact build number for the version.
 - The default channel comes from `config.json`, and defaults to `STABLE`.
 - Version upgrades still prompt unless you add `--yes`.
+- `--force` lets you re-download and reinstall the same build even if it is already present.
+- Use `./paperscript --force update` to re-download the current latest stable build.
+- Use `./paperscript --force download --version <version> --build <build>` to re-download one exact build.
 
 ## Global Options
 
@@ -198,7 +224,7 @@ Notes:
 - `--yes`
   Accept prompts automatically. If a running server is detected, PaperScript will try a graceful stop automatically.
 - `--force`
-  Reinstall even if the same or a newer build is already present.
+  Reinstall even if the same build is already present. Useful with `update` or `download`.
 - `--dry-run`
   Show what would happen without downloading, moving jars, pruning backups, or stopping the server.
 
@@ -330,6 +356,7 @@ See what a live server would do without changing anything:
 
 ```bash
 ./PaperScript/paperscript status
+./PaperScript/paperscript verify
 ./PaperScript/paperscript update --dry-run
 ```
 
