@@ -1,0 +1,13 @@
+# Python
+__pycache__/
+*.py[cod]
+
+# PaperScript runtime files
+backups/
+downloads/
+logs.log
+config.json
+state.json
+
+# macOS
+.DS_Store

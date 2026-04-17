@@ -1,0 +1,1149 @@
+#!/usr/bin/env python3
+"""PaperScript: a PaperMC updater focused on safe, interactive server upgrades."""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import os
+import re
+import shutil
+import signal
+import subprocess
+import sys
+import time
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
+from urllib.error import HTTPError, URLError
+from urllib.request import Request, urlopen
+
+
+APP_NAME = "PaperScript"
+APP_VERSION = "0.1.0"
+API_ROOT = "https://fill.papermc.io/v3/projects/paper"
+DEFAULT_CHANNEL = "STABLE"
+DEFAULT_TIMEOUT = 30
+DEFAULT_USER_AGENT = "mrfloris-PaperScript/2.0 (https://github.com/mrfdev/PaperScript)"
+CURRENT_JAR_PATTERN = re.compile(r"^paper-(.+)-(\d+)\.jar$", re.IGNORECASE)
+DEFAULT_CONFIG: dict[str, Any] = {
+    "server_name": None,
+    "tmux_session": "mcserver",
+    "default_channel": "STABLE",
+    "check_latest_channel_only": "STABLE",
+    "allow_cross_version_auto_upgrade": False,
+    "allow_same_version_build_upgrade": True,
+    "keep_backups": 10,
+    "cleanup_backups_after_install": True,
+    "running_server_action": "ask",
+    "graceful_stop_command": "stop",
+    "http_timeout_seconds": 30,
+    "status_show_all_channels": True,
+    "download_filename_pattern": "Paper-{version}-{build}.jar",
+    "log_file": "logs.log",
+    "backup_dir": "backups",
+    "downloads_dir": "downloads",
+    "confirm_before_force_download": True,
+    "confirm_before_downgrade": True,
+    "auto_detect_server_by_port": True,
+    "fallback_process_detection": True,
+}
+
+
+class PaperScriptError(Exception):
+    """Raised when the script cannot continue safely."""
+
+
+@dataclass(frozen=True)
+class ParsedVersion:
+    raw: str
+    numbers: tuple[int, ...]
+    suffix_rank: int
+    suffix_number: int
+
+    def key(self) -> tuple[tuple[int, ...], int, int]:
+        return (self.numbers, self.suffix_rank, self.suffix_number)
+
+
+@dataclass
+class JarInfo:
+    path: Path
+    version: str
+    build: int
+
+
+@dataclass
+class BuildInfo:
+    version: str
+    build_id: int
+    channel: str
+    download_name: str
+    download_url: str
+    sha256: str | None
+    size: int | None
+    created_at: str | None
+
+    @property
+    def filename(self) -> str:
+        return f"Paper-{self.version}-{self.build_id}.jar"
+
+
+def utc_now() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def parse_version(version: str) -> ParsedVersion:
+    base, _, suffix = version.partition("-")
+    number_parts: list[int] = []
+    for part in base.split("."):
+        if part.isdigit():
+            number_parts.append(int(part))
+        else:
+            match = re.match(r"(\d+)", part)
+            number_parts.append(int(match.group(1)) if match else 0)
+
+    suffix_rank = 3
+    suffix_number = 0
+    if suffix:
+        match = re.match(r"([A-Za-z]+)(\d*)", suffix)
+        label = match.group(1).lower() if match else suffix.lower()
+        suffix_number = int(match.group(2)) if match and match.group(2) else 0
+        if label in {"alpha", "a"}:
+            suffix_rank = 0
+        elif label in {"beta", "b", "pre", "preview"}:
+            suffix_rank = 1
+        elif label in {"rc"}:
+            suffix_rank = 2
+        else:
+            suffix_rank = 0
+
+    return ParsedVersion(
+        raw=version,
+        numbers=tuple(number_parts),
+        suffix_rank=suffix_rank,
+        suffix_number=suffix_number,
+    )
+
+
+def compare_versions(left: str, right: str) -> int:
+    a = parse_version(left).key()
+    b = parse_version(right).key()
+    if a < b:
+        return -1
+    if a > b:
+        return 1
+    return 0
+
+
+def prompt_yes_no(question: str, default: bool = False) -> bool:
+    suffix = "[Y/n]" if default else "[y/N]"
+    while True:
+        reply = input(f"{question} {suffix} ").strip().lower()
+        if not reply:
+            return default
+        if reply in {"y", "yes"}:
+            return True
+        if reply in {"n", "no"}:
+            return False
+        print("Please answer yes or no.")
+
+
+def prompt_choice(question: str, choices: list[tuple[str, str]], default: str | None = None) -> str:
+    print(question)
+    for key, label in choices:
+        default_mark = " (default)" if default == key else ""
+        print(f"  {key}) {label}{default_mark}")
+    valid = {key for key, _ in choices}
+    while True:
+        reply = input("> ").strip().lower()
+        if not reply and default is not None:
+            return default
+        if reply in valid:
+            return reply
+        print(f"Choose one of: {', '.join(sorted(valid))}")
+
+
+def parse_properties(path: Path) -> dict[str, str]:
+    properties: dict[str, str] = {}
+    if not path.exists():
+        return properties
+    for raw_line in path.read_text(encoding="utf-8", errors="ignore").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        properties[key.strip()] = value.strip()
+    return properties
+
+
+def ensure_directory(path: Path) -> None:
+    path.mkdir(parents=True, exist_ok=True)
+
+
+def run_command(args: list[str]) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        args,
+        check=False,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+
+
+def format_bytes(size: int | None) -> str:
+    if size is None:
+        return "unknown size"
+    units = ["B", "KB", "MB", "GB"]
+    value = float(size)
+    for unit in units:
+        if value < 1024 or unit == units[-1]:
+            return f"{value:.1f} {unit}"
+        value /= 1024
+    return f"{size} B"
+
+
+def format_bool(value: bool) -> str:
+    return "yes" if value else "no"
+
+
+class Logger:
+    def __init__(self, log_path: Path, quiet: bool = False) -> None:
+        self.log_path = log_path
+        self.quiet = quiet
+        ensure_directory(log_path.parent)
+
+    def log(self, message: str) -> None:
+        line = f"[{utc_now()}] {message}"
+        with self.log_path.open("a", encoding="utf-8") as handle:
+            handle.write(line + "\n")
+        if not self.quiet:
+            print(message)
+
+    def error(self, message: str) -> None:
+        self.log(f"ERROR: {message}")
+
+
+class PaperAPI:
+    def __init__(self, user_agent: str, timeout: int = DEFAULT_TIMEOUT) -> None:
+        self.user_agent = user_agent
+        self.timeout = timeout
+
+    def _request_json(self, url: str) -> Any:
+        request = Request(url, headers={"User-Agent": self.user_agent, "Accept": "application/json"})
+        try:
+            with urlopen(request, timeout=self.timeout) as response:
+                payload = response.read().decode("utf-8")
+        except HTTPError as error:
+            detail = error.read().decode("utf-8", errors="ignore") if hasattr(error, "read") else ""
+            raise PaperScriptError(f"API request failed for {url}: HTTP {error.code} {detail}".strip()) from error
+        except URLError as error:
+            raise PaperScriptError(f"API request failed for {url}: {error.reason}") from error
+
+        try:
+            data = json.loads(payload)
+        except json.JSONDecodeError as error:
+            raise PaperScriptError(f"API returned invalid JSON for {url}") from error
+
+        if isinstance(data, dict) and data.get("ok") is False:
+            raise PaperScriptError(data.get("message") or f"API returned an error for {url}")
+        return data
+
+    def get_project_versions(self) -> list[dict[str, Any]]:
+        rich = self._request_json(f"{API_ROOT}/versions")
+        if isinstance(rich, dict) and isinstance(rich.get("versions"), list):
+            versions: list[dict[str, Any]] = []
+            for item in rich["versions"]:
+                version_info = item.get("version", {})
+                version_id = (
+                    version_info.get("id")
+                    or item.get("id")
+                    or item.get("key")
+                )
+                if not version_id:
+                    continue
+                normalized = dict(item)
+                normalized["id"] = version_id
+                normalized["group"] = version_info.get("group") or item.get("group") or guess_version_group(version_id)
+                versions.append(normalized)
+            if versions:
+                return sorted(versions, key=lambda item: parse_version(item["id"]).key(), reverse=True)
+
+        simple = self._request_json(API_ROOT)
+        raw_versions = simple.get("versions", {})
+        flattened: list[dict[str, Any]] = []
+        if isinstance(raw_versions, dict):
+            for group, items in raw_versions.items():
+                for version_id in items:
+                    flattened.append({"id": version_id, "group": group})
+        return sorted(flattened, key=lambda item: parse_version(item["id"]).key(), reverse=True)
+
+    def get_builds(self, version: str) -> list[BuildInfo]:
+        raw = self._request_json(f"{API_ROOT}/versions/{version}/builds")
+        builds = raw.get("builds") if isinstance(raw, dict) else raw
+        if not isinstance(builds, list):
+            raise PaperScriptError(f"Unexpected build payload for version {version}")
+
+        normalized: list[BuildInfo] = []
+        for item in builds:
+            if not isinstance(item, dict):
+                continue
+            download = item.get("downloads", {}).get("server:default", {})
+            build_id = item.get("id") or item.get("number") or item.get("build")
+            if build_id is None or not download.get("url"):
+                continue
+            normalized.append(
+                BuildInfo(
+                    version=version,
+                    build_id=int(build_id),
+                    channel=str(item.get("channel", "UNKNOWN")).upper(),
+                    download_name=str(download.get("name") or f"Paper-{version}-{build_id}.jar"),
+                    download_url=str(download["url"]),
+                    sha256=download.get("checksums", {}).get("sha256"),
+                    size=download.get("size"),
+                    created_at=item.get("createdAt") or item.get("time"),
+                )
+            )
+        normalized.sort(key=lambda item: item.build_id, reverse=True)
+        return normalized
+
+    def get_latest_build(self, version: str, channel: str = DEFAULT_CHANNEL) -> BuildInfo | None:
+        channel_upper = channel.upper()
+        for build in self.get_builds(version):
+            if build.channel == channel_upper:
+                return build
+        return None
+
+    def download_file(self, build: BuildInfo, destination: Path) -> None:
+        ensure_directory(destination.parent)
+        request = Request(build.download_url, headers={"User-Agent": self.user_agent})
+        sha256 = hashlib.sha256()
+        try:
+            with urlopen(request, timeout=self.timeout) as response, destination.open("wb") as handle:
+                while True:
+                    chunk = response.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    sha256.update(chunk)
+                    handle.write(chunk)
+        except HTTPError as error:
+            detail = error.read().decode("utf-8", errors="ignore") if hasattr(error, "read") else ""
+            raise PaperScriptError(f"Download failed: HTTP {error.code} {detail}".strip()) from error
+        except URLError as error:
+            raise PaperScriptError(f"Download failed: {error.reason}") from error
+
+        if build.sha256:
+            digest = sha256.hexdigest()
+            if digest.lower() != build.sha256.lower():
+                raise PaperScriptError(
+                    f"Checksum mismatch for {build.filename}: expected {build.sha256}, got {digest}"
+                )
+
+
+def guess_version_group(version: str) -> str:
+    pieces = version.split(".")
+    if len(pieces) >= 2:
+        return ".".join(pieces[:2])
+    return version
+
+
+class PaperScriptApp:
+    def __init__(self, args: argparse.Namespace) -> None:
+        self.args = args
+        self.script_dir = Path(__file__).resolve().parent
+        self.runtime_dir = self.script_dir
+        self.server_dir = self._resolve_server_dir()
+        self.config_path = self.runtime_dir / "config.json"
+        self.state_path = self.runtime_dir / "state.json"
+        self.config = self._load_config()
+        self.backups_dir = self.runtime_dir / str(self.config["backup_dir"])
+        self.downloads_dir = self.runtime_dir / str(self.config["downloads_dir"])
+        self.log_path = self.runtime_dir / str(self.config["log_file"])
+        self.logger = Logger(self.log_path, quiet=False)
+        ensure_directory(self.backups_dir)
+        ensure_directory(self.downloads_dir)
+        self.state = self._load_json(self.state_path)
+        self.server_name = self.config.get("server_name")
+        self.default_channel = str(self.config["default_channel"]).upper()
+        self.check_latest_channel_only = str(self.config["check_latest_channel_only"]).upper()
+        self.allow_cross_version_auto_upgrade = bool(self.config["allow_cross_version_auto_upgrade"])
+        self.allow_same_version_build_upgrade = bool(self.config["allow_same_version_build_upgrade"])
+        self.keep_backups = int(self.config["keep_backups"])
+        self.cleanup_backups_after_install = bool(self.config["cleanup_backups_after_install"])
+        self.running_server_action = str(self.config["running_server_action"])
+        self.graceful_stop_command = str(self.config["graceful_stop_command"])
+        self.status_show_all_channels = bool(self.config["status_show_all_channels"])
+        self.download_filename_pattern = str(self.config["download_filename_pattern"])
+        self.confirm_before_force_download = bool(self.config["confirm_before_force_download"])
+        self.confirm_before_downgrade = bool(self.config["confirm_before_downgrade"])
+        self.auto_detect_server_by_port = bool(self.config["auto_detect_server_by_port"])
+        self.fallback_process_detection = bool(self.config["fallback_process_detection"])
+        self.http_timeout = int(args.timeout) if args.timeout is not None else int(self.config["http_timeout_seconds"])
+        self.user_agent = self._resolve_user_agent()
+        self.api = PaperAPI(self.user_agent, timeout=self.http_timeout)
+        self.tmux_session = (
+            args.tmux_session
+            or os.environ.get("PAPERSCRIPT_TMUX_SESSION")
+            or self.config.get("tmux_session")
+            or "mcserver"
+        )
+
+    def _resolve_server_dir(self) -> Path:
+        if self.args.server_dir:
+            return Path(self.args.server_dir).expanduser().resolve()
+        cwd = Path.cwd().resolve()
+        if cwd == self.script_dir and self.script_dir.name.lower() == APP_NAME.lower():
+            return self.script_dir.parent.resolve()
+        return cwd
+
+    def _load_json(self, path: Path) -> dict[str, Any]:
+        if not path.exists():
+            return {}
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return {}
+        return payload if isinstance(payload, dict) else {}
+
+    def _save_json(self, path: Path, payload: dict[str, Any]) -> None:
+        path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+    def _load_config(self) -> dict[str, Any]:
+        raw = self._load_json(self.config_path)
+        merged = dict(DEFAULT_CONFIG)
+        merged.update(raw)
+        if raw != merged:
+            self._save_json(self.config_path, merged)
+        return merged
+
+    def _resolve_user_agent(self) -> str:
+        configured = (
+            self.args.user_agent
+            or os.environ.get("PAPERSCRIPT_USER_AGENT")
+            or self.config.get("user_agent")
+        )
+        if configured:
+            return configured
+
+        contact = (
+            self.args.contact
+            or os.environ.get("PAPERSCRIPT_CONTACT")
+            or self.config.get("contact")
+        )
+        if contact and sys.stdin.isatty():
+            if not self.config.get("contact"):
+                self.config["contact"] = contact
+                self._save_json(self.config_path, self.config)
+            return f"{APP_NAME}/{APP_VERSION} ({contact})"
+
+        return DEFAULT_USER_AGENT
+
+    def record_state(self, build: BuildInfo, installed_path: Path) -> None:
+        self.state.update(
+            {
+                "current_build": build.build_id,
+                "current_jar": installed_path.name,
+                "current_version": build.version,
+                "installed_at": utc_now(),
+                "server_dir": str(self.server_dir),
+            }
+        )
+        self._save_json(self.state_path, self.state)
+
+    def find_current_jar(self) -> JarInfo | None:
+        state_name = self.state.get("current_jar")
+        if state_name:
+            state_path = self.server_dir / state_name
+            match = CURRENT_JAR_PATTERN.match(state_path.name)
+            if state_path.exists() and match:
+                return JarInfo(state_path, match.group(1), int(match.group(2)))
+
+        candidates: list[JarInfo] = []
+        for path in self.server_dir.glob("*.jar"):
+            match = CURRENT_JAR_PATTERN.match(path.name)
+            if not match:
+                continue
+            candidates.append(JarInfo(path, match.group(1), int(match.group(2))))
+        if not candidates:
+            return None
+
+        candidates.sort(
+            key=lambda item: (parse_version(item.version).key(), item.build),
+            reverse=True,
+        )
+        return candidates[0]
+
+    def latest_stable_version(self) -> tuple[str, BuildInfo]:
+        versions = [item["id"] for item in self.api.get_project_versions()]
+        for version in versions:
+            build = self.api.get_latest_build(version, channel=self.check_latest_channel_only)
+            if build:
+                return version, build
+        raise PaperScriptError("No stable Paper builds were found.")
+
+    def describe_server_context(self) -> None:
+        has_server_properties = (self.server_dir / "server.properties").exists()
+        current_jar = self.find_current_jar()
+        self.logger.log(f"Script directory: {self.script_dir}")
+        self.logger.log(f"Server directory: {self.server_dir}")
+        self.logger.log(f"Runtime directory: {self.runtime_dir}")
+        self.logger.log(f"Server properties found: {'yes' if has_server_properties else 'no'}")
+        if current_jar:
+            self.logger.log(
+                f"Detected current jar: {current_jar.path.name} "
+                f"(version {current_jar.version}, build {current_jar.build})"
+            )
+        else:
+            self.logger.log("Detected current jar: none")
+
+    def list_versions(self, show_channels: bool = False) -> None:
+        versions = self.api.get_project_versions()
+        self.logger.log(f"Found {len(versions)} Paper versions from the API.")
+        for item in versions:
+            line = item["id"]
+            extra: list[str] = []
+            if item.get("group"):
+                extra.append(f"group {item['group']}")
+            if item.get("support"):
+                extra.append(f"support {item['support']}")
+            minimum_java = item.get("minimumJavaVersion") or item.get("minimum_java_version")
+            if minimum_java:
+                extra.append(f"java {minimum_java}+")
+            if show_channels:
+                summaries = self.latest_channel_summaries(item["id"])
+                if summaries:
+                    extra.append(", ".join(summaries))
+            if extra:
+                self.logger.log(f"  - {line} ({'; '.join(extra)})")
+            else:
+                self.logger.log(f"  - {line}")
+
+    def latest_channel_summaries(self, version: str) -> list[str]:
+        builds = self.api.get_builds(version)
+        channels: dict[str, BuildInfo] = {}
+        for build in builds:
+            channels.setdefault(build.channel, build)
+        output: list[str] = []
+        for channel in ["STABLE", "BETA", "ALPHA", "RECOMMENDED"]:
+            build = channels.get(channel)
+            if build:
+                output.append(f"{channel.lower()} #{build.build_id}")
+        return output
+
+    def latest_builds_by_channel(self, version: str) -> dict[str, BuildInfo]:
+        builds = self.api.get_builds(version)
+        channels: dict[str, BuildInfo] = {}
+        for build in builds:
+            channels.setdefault(build.channel, build)
+        return channels
+
+    def inspect_version(self, version: str, offer_download: bool = True) -> None:
+        by_channel = self.latest_builds_by_channel(version)
+        if not by_channel:
+            raise PaperScriptError(f"No builds found for version {version}")
+
+        self.logger.log(f"Latest known builds for version {version}:")
+        for channel in ["STABLE", "BETA", "ALPHA", "RECOMMENDED"]:
+            build = by_channel.get(channel)
+            if build:
+                created = f", created {build.created_at}" if build.created_at else ""
+                self.logger.log(
+                    f"  - {channel}: build #{build.build_id}, {build.filename}, "
+                    f"{format_bytes(build.size)}{created}"
+                )
+
+        if offer_download and sys.stdin.isatty():
+            if prompt_yes_no(f"Download a build for version {version} now?", default=False):
+                choices = [(channel.lower(), channel.title()) for channel in by_channel]
+                selected = prompt_choice("Which channel do you want?", choices, default="stable" if "STABLE" in by_channel else None)
+                self.install_build(by_channel[selected.upper()], force_version_prompt=True)
+
+    def explore_versions(self) -> None:
+        versions = [item["id"] for item in self.api.get_project_versions()]
+        print("Available versions:")
+        for index, version in enumerate(versions, start=1):
+            print(f"  {index:>2}. {version}")
+        while True:
+            reply = input("Pick a version number (or press Enter to cancel): ").strip()
+            if not reply:
+                self.logger.log("Cancelled version explorer.")
+                return
+            if reply.isdigit() and 1 <= int(reply) <= len(versions):
+                selected = versions[int(reply) - 1]
+                self.inspect_version(selected, offer_download=True)
+                return
+            print("Please enter one of the listed numbers.")
+
+    def choose_target_for_update(self) -> BuildInfo | None:
+        current = self.find_current_jar()
+        latest_version, latest_build = self.latest_stable_version()
+
+        if current is None:
+            self.logger.log(
+                f"No current Paper jar detected. Latest stable is version {latest_version} build #{latest_build.build_id}."
+            )
+            return latest_build
+
+        version_cmp = compare_versions(current.version, latest_version)
+        if version_cmp == 0:
+            if latest_build.build_id > current.build:
+                if not self.allow_same_version_build_upgrade:
+                    self.logger.log(
+                        "A newer build exists for the current version, but same-version build upgrades are disabled in config."
+                    )
+                    return None
+                self.logger.log(
+                    f"Current server is on {current.version} build #{current.build}. "
+                    f"Latest stable build is #{latest_build.build_id}."
+                )
+                return latest_build
+            self.logger.log(
+                f"Current server is already on {current.version} build #{current.build}. "
+                "No newer stable build is available."
+            )
+            return None
+
+        if version_cmp > 0:
+            self.logger.log(
+                f"Current server version {current.version} is newer than the latest stable version "
+                f"this script found ({latest_version}). Nothing will be changed automatically."
+            )
+            return None
+
+        self.logger.log(
+            f"Current server is on version {current.version} build #{current.build}. "
+            f"Latest stable is {latest_version} build #{latest_build.build_id}."
+        )
+        if self.allow_cross_version_auto_upgrade:
+            self.logger.log("Cross-version auto-upgrade is enabled in config, so PaperScript will continue.")
+            return latest_build
+        if self.args.dry_run:
+            self.logger.log(
+                f"Dry run: PaperScript would ask before upgrading from {current.version} to {latest_version}."
+            )
+            return latest_build
+        if self.args.yes or prompt_yes_no(
+            f"This is a version upgrade from {current.version} to {latest_version}. Download it?",
+            default=False,
+        ):
+            return latest_build
+        self.logger.log("Skipped version upgrade by choice.")
+        return None
+
+    def ensure_safe_to_upgrade(self) -> None:
+        if not (self.server_dir / "server.properties").exists():
+            return
+        processes = self.detect_running_server_processes()
+        if not processes:
+            return
+
+        self.logger.log("A Paper server process appears to be running in this server directory.")
+        for pid, command in processes:
+            self.logger.log(f"  - PID {pid}: {command}")
+
+        if self.args.dry_run:
+            action = self.planned_running_server_action()
+            self.logger.log(f"Dry run: PaperScript would handle the running server with action '{action}'.")
+            return
+
+        if self.args.yes:
+            self.logger.log("--yes was supplied, so PaperScript will try a graceful stop automatically.")
+            self.graceful_stop(processes)
+            return
+
+        configured_action = self.running_server_action
+        if configured_action == "graceful-stop":
+            self.graceful_stop(processes)
+            return
+        if configured_action == "force-stop":
+            self.force_stop(processes)
+            return
+        if configured_action == "upgrade-anyway":
+            self.logger.log("Config is set to continue even if the server appears to still be running.")
+            return
+
+        choice = prompt_choice(
+            "Choose how to continue:",
+            [
+                ("g", "Gracefully stop the server first"),
+                ("f", "Force stop the server"),
+                ("u", "Upgrade anyway without stopping"),
+                ("e", "Exit without changing anything"),
+            ],
+            default="e",
+        )
+        if choice == "g":
+            self.graceful_stop(processes)
+            return
+        if choice == "f":
+            self.force_stop(processes)
+            return
+        if choice == "u":
+            self.logger.log("Proceeding even though the server appears to still be running.")
+            return
+        raise PaperScriptError("Stopped at user request.")
+
+    def detect_running_server_processes(self) -> list[tuple[int, str]]:
+        if self.auto_detect_server_by_port:
+            by_port = self.detect_processes_by_server_port()
+            if by_port:
+                return by_port
+
+        if not self.fallback_process_detection:
+            return []
+
+        result = run_command(["ps", "-axo", "pid=,command="])
+        if result.returncode != 0:
+            return []
+
+        current = self.find_current_jar()
+        jar_name = current.path.name if current else None
+        server_dir_text = str(self.server_dir)
+        matches: list[tuple[int, str]] = []
+        for line in result.stdout.splitlines():
+            stripped = line.strip()
+            if not stripped:
+                continue
+            pid_text, _, command = stripped.partition(" ")
+            if not pid_text.isdigit():
+                continue
+            pid = int(pid_text)
+            command = command.strip()
+            if "java" not in command.lower():
+                continue
+            if jar_name and jar_name in command:
+                matches.append((pid, command))
+                continue
+            if server_dir_text in command:
+                matches.append((pid, command))
+                continue
+            cwd = self.process_cwd(pid)
+            if cwd and Path(cwd).resolve() == self.server_dir:
+                matches.append((pid, command))
+        return matches
+
+    def detect_processes_by_server_port(self) -> list[tuple[int, str]]:
+        properties = parse_properties(self.server_dir / "server.properties")
+        port_text = properties.get("server-port", "25565").strip()
+        if not port_text.isdigit():
+            return []
+
+        result = run_command(["lsof", "-nP", f"-iTCP:{port_text}", "-sTCP:LISTEN", "-Fp", "-Fc", "-Fn"])
+        if result.returncode != 0:
+            return []
+
+        matches: list[tuple[int, str]] = []
+        current_pid: int | None = None
+        current_command = ""
+        for line in result.stdout.splitlines():
+            if not line:
+                continue
+            prefix = line[0]
+            value = line[1:]
+            if prefix == "p":
+                if current_pid is not None and "java" in current_command.lower():
+                    matches.append((current_pid, current_command or "java"))
+                current_pid = int(value) if value.isdigit() else None
+                current_command = ""
+            elif prefix == "c":
+                current_command = value
+        if current_pid is not None and "java" in current_command.lower():
+            matches.append((current_pid, current_command or "java"))
+        return matches
+
+    def planned_running_server_action(self) -> str:
+        if self.args.yes:
+            return "graceful-stop"
+        if self.running_server_action in {"ask", "graceful-stop", "force-stop", "upgrade-anyway"}:
+            return self.running_server_action
+        return "ask"
+
+    def process_cwd(self, pid: int) -> str | None:
+        result = run_command(["lsof", "-a", "-d", "cwd", "-p", str(pid), "-Fn"])
+        if result.returncode != 0:
+            return None
+        for line in result.stdout.splitlines():
+            if line.startswith("n"):
+                return line[1:]
+        return None
+
+    def graceful_stop(self, processes: list[tuple[int, str]]) -> None:
+        if self.try_tmux_stop():
+            if self.wait_for_exit([pid for pid, _ in processes], timeout_seconds=45):
+                self.logger.log("Server stopped after sending the tmux stop command.")
+                return
+            self.logger.log("The tmux stop command was sent, but the process is still running.")
+
+        for pid, _ in processes:
+            os.kill(pid, signal.SIGTERM)
+            self.logger.log(f"Sent SIGTERM to PID {pid}.")
+        if not self.wait_for_exit([pid for pid, _ in processes], timeout_seconds=20):
+            raise PaperScriptError("The server did not stop after a soft shutdown attempt.")
+        self.logger.log("Server stopped.")
+
+    def force_stop(self, processes: list[tuple[int, str]]) -> None:
+        for pid, _ in processes:
+            os.kill(pid, signal.SIGKILL)
+            self.logger.log(f"Sent SIGKILL to PID {pid}.")
+        if not self.wait_for_exit([pid for pid, _ in processes], timeout_seconds=10):
+            raise PaperScriptError("A server process still appears to be running after SIGKILL.")
+        self.logger.log("Server force-stopped.")
+
+    def wait_for_exit(self, pids: list[int], timeout_seconds: int) -> bool:
+        deadline = time.time() + timeout_seconds
+        remaining = set(pids)
+        while remaining and time.time() < deadline:
+            finished: list[int] = []
+            for pid in remaining:
+                try:
+                    os.kill(pid, 0)
+                except OSError:
+                    finished.append(pid)
+            for pid in finished:
+                remaining.discard(pid)
+            if remaining:
+                time.sleep(1)
+        return not remaining
+
+    def try_tmux_stop(self) -> bool:
+        session = self.tmux_session
+        has_session = run_command(["tmux", "has-session", "-t", session])
+        if has_session.returncode != 0:
+            self.logger.log(
+                f"tmux session '{session}' was not found, so PaperScript cannot send a graceful stop command there."
+            )
+            return False
+
+        send = run_command(["tmux", "send-keys", "-t", session, self.graceful_stop_command, "Enter"])
+        if send.returncode != 0:
+            self.logger.log(
+                f"Sending '{self.graceful_stop_command}' to tmux session '{session}' failed: "
+                f"{send.stderr.strip() or 'unknown error'}"
+            )
+            return False
+
+        self.logger.log(f"Sent '{self.graceful_stop_command}' to tmux session '{session}'.")
+        return True
+
+    def backup_existing_jar(self, current: JarInfo | None, incoming_name: str) -> None:
+        if current and current.path.exists():
+            destination = self.backups_dir / f"{timestamp_for_filename()}__{current.path.name}"
+            shutil.move(str(current.path), str(destination))
+            self.logger.log(f"Backed up current jar to {destination}")
+
+        incoming_path = self.server_dir / incoming_name
+        if incoming_path.exists():
+            destination = self.backups_dir / f"{timestamp_for_filename()}__{incoming_path.name}"
+            shutil.move(str(incoming_path), str(destination))
+            self.logger.log(f"Backed up existing target jar to {destination}")
+
+    def prune_old_backups(self) -> None:
+        if not self.cleanup_backups_after_install or self.keep_backups < 0:
+            return
+
+        backups = [path for path in self.backups_dir.iterdir() if path.is_file()]
+        backups.sort(key=lambda item: item.stat().st_mtime, reverse=True)
+        for old_path in backups[self.keep_backups:]:
+            old_path.unlink()
+            self.logger.log(f"Removed old backup {old_path}")
+
+    def format_download_filename(self, build: BuildInfo) -> str:
+        try:
+            return self.download_filename_pattern.format(version=build.version, build=build.build_id)
+        except (KeyError, IndexError, ValueError):
+            return f"Paper-{build.version}-{build.build_id}.jar"
+
+    def print_dry_run_summary(self, target_path: Path, current: JarInfo | None, build: BuildInfo) -> None:
+        self.logger.log("Dry run: no files were changed.")
+        self.logger.log(f"Dry run: would download {build.download_url}")
+        self.logger.log(f"Dry run: would stage the jar in {self.downloads_dir}")
+        if current:
+            self.logger.log(f"Dry run: would back up {current.path.name} into {self.backups_dir}")
+        if target_path.exists():
+            self.logger.log(f"Dry run: would also back up existing target jar {target_path.name}")
+        self.logger.log(f"Dry run: would install {target_path}")
+        if self.cleanup_backups_after_install:
+            self.logger.log(f"Dry run: would keep the newest {self.keep_backups} backups after install.")
+
+    def install_build(self, build: BuildInfo, force_version_prompt: bool = False) -> None:
+        current = self.find_current_jar()
+        target_name = self.format_download_filename(build)
+        if current and current.version == build.version and current.build >= build.build_id and not self.args.force:
+            self.logger.log(
+                f"Current jar {current.path.name} is already build #{current.build} for version {current.version}. "
+                "Nothing newer needs to be downloaded."
+            )
+            return
+
+        if current and current.version == build.version and current.build < build.build_id and not self.allow_same_version_build_upgrade:
+            self.logger.log("Same-version build upgrades are disabled in config, so the newer build will not be installed.")
+            return
+
+        if current and self.args.force and self.confirm_before_force_download and not self.args.yes and not self.args.dry_run:
+            if not prompt_yes_no("Force download is enabled. Continue with the requested install?", default=False):
+                self.logger.log("Cancelled forced download.")
+                return
+        elif current and self.args.force and self.confirm_before_force_download and self.args.dry_run:
+            self.logger.log("Dry run: PaperScript would ask for confirmation before a forced download.")
+
+        if current and compare_versions(current.version, build.version) > 0 and self.confirm_before_downgrade and not self.args.yes and not self.args.dry_run:
+            if not prompt_yes_no(
+                f"This appears to be a downgrade from version {current.version} to {build.version}. Continue?",
+                default=False,
+            ):
+                self.logger.log("Cancelled downgrade.")
+                return
+        elif current and compare_versions(current.version, build.version) > 0 and self.confirm_before_downgrade and self.args.dry_run:
+            self.logger.log(
+                f"Dry run: PaperScript would ask before downgrading from {current.version} to {build.version}."
+            )
+
+        if current and compare_versions(current.version, build.version) < 0 and force_version_prompt and not self.args.yes:
+            if self.args.dry_run:
+                self.logger.log(
+                    f"Dry run: PaperScript would ask before upgrading from {current.version} to {build.version}."
+                )
+            elif not prompt_yes_no(
+                f"This will upgrade from version {current.version} to {build.version}. Continue?",
+                default=False,
+            ):
+                self.logger.log("Cancelled version upgrade.")
+                return
+
+        self.ensure_safe_to_upgrade()
+
+        target_path = self.server_dir / target_name
+        temp_path = self.downloads_dir / f"{target_name}.part"
+        final_temp = self.downloads_dir / target_name
+
+        if self.args.dry_run:
+            self.print_dry_run_summary(target_path, current, build)
+            return
+
+        if temp_path.exists():
+            temp_path.unlink()
+        if final_temp.exists():
+            final_temp.unlink()
+
+        self.logger.log(
+            f"Downloading Paper {build.version} build #{build.build_id} "
+            f"({build.channel}, {format_bytes(build.size)})..."
+        )
+        try:
+            self.api.download_file(build, temp_path)
+        except Exception:
+            if temp_path.exists():
+                temp_path.unlink()
+            raise
+        temp_path.rename(final_temp)
+        self.logger.log(f"Downloaded to {final_temp}")
+
+        self.backup_existing_jar(current, target_name)
+        shutil.move(str(final_temp), str(target_path))
+        self.logger.log(f"Installed {target_path}")
+        self.record_state(build, target_path)
+        self.prune_old_backups()
+
+    def run_update(self) -> None:
+        self.describe_server_context()
+        target = self.choose_target_for_update()
+        if target is None:
+            return
+        self.install_build(target, force_version_prompt=False)
+
+    def run_download(self, version: str, build_id: int | None, channel: str) -> None:
+        if build_id is not None:
+            builds = self.api.get_builds(version)
+            selected = next((build for build in builds if build.build_id == build_id), None)
+            if not selected:
+                raise PaperScriptError(f"Build #{build_id} was not found for version {version}")
+            self.install_build(selected, force_version_prompt=True)
+            return
+
+        selected = self.api.get_latest_build(version, channel=channel)
+        if not selected:
+            raise PaperScriptError(f"No {channel.upper()} build was found for version {version}")
+        self.install_build(selected, force_version_prompt=True)
+
+    def run_status(self) -> None:
+        properties = parse_properties(self.server_dir / "server.properties")
+        current = self.find_current_jar()
+        running = self.detect_running_server_processes()
+        latest_version, latest_build = self.latest_stable_version()
+
+        self.logger.log(f"PaperScript version: {APP_VERSION}")
+        self.logger.log(f"Server directory: {self.server_dir}")
+        self.logger.log(f"Runtime directory: {self.runtime_dir}")
+        self.logger.log(f"Server label: {self.server_name or 'none'}")
+        self.logger.log(f"tmux session: {self.tmux_session}")
+        self.logger.log(f"Server properties found: {format_bool((self.server_dir / 'server.properties').exists())}")
+        self.logger.log(f"Configured server port: {properties.get('server-port', '25565')}")
+        self.logger.log(f"Running server detected: {format_bool(bool(running))}")
+        if running:
+            for pid, command in running:
+                self.logger.log(f"  - PID {pid}: {command}")
+        if current:
+            self.logger.log(
+                f"Current jar: {current.path.name} (version {current.version}, build #{current.build})"
+            )
+        else:
+            self.logger.log("Current jar: none")
+
+        self.logger.log(
+            f"Latest {self.check_latest_channel_only.lower()} release: {latest_version} build #{latest_build.build_id}"
+        )
+        if current is None:
+            self.logger.log("Update status: no installed jar detected, so PaperScript would offer the latest release.")
+        else:
+            version_cmp = compare_versions(current.version, latest_version)
+            if version_cmp == 0:
+                if latest_build.build_id > current.build:
+                    self.logger.log(
+                        f"Update status: newer build available for the same version ({current.build} -> {latest_build.build_id})."
+                    )
+                elif latest_build.build_id == current.build:
+                    self.logger.log("Update status: already on the latest stable build.")
+                else:
+                    self.logger.log("Update status: installed build is newer than the latest stable build this script found.")
+            elif version_cmp < 0:
+                self.logger.log(
+                    f"Update status: newer version available ({current.version} -> {latest_version})."
+                )
+            else:
+                self.logger.log("Update status: installed version is newer than the latest stable version this script found.")
+
+        if self.status_show_all_channels:
+            self.logger.log(f"Latest channels for {latest_version}:")
+            channels = self.latest_builds_by_channel(latest_version)
+            for channel in ["STABLE", "BETA", "ALPHA", "RECOMMENDED"]:
+                build = channels.get(channel)
+                if build:
+                    self.logger.log(
+                        f"  - {channel}: build #{build.build_id}, {format_bytes(build.size)}"
+                    )
+        self.logger.log(
+            f"Backup retention: keep {self.keep_backups} backups, cleanup after install {format_bool(self.cleanup_backups_after_install)}"
+        )
+
+
+def timestamp_for_filename() -> str:
+    return datetime.now().strftime("%Y%m%d-%H%M%S")
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="paperscript.py",
+        description="Download and upgrade Paper server jars through the Fill v3 API.",
+    )
+    parser.add_argument("--server-dir", help="Target server directory. Defaults to the current directory.")
+    parser.add_argument(
+        "--user-agent",
+        help="Custom User-Agent header to send to the PaperMC API. Defaults to the built-in PaperScript identity.",
+    )
+    parser.add_argument(
+        "--tmux-session",
+        help="tmux session name to use for graceful stop. Defaults to config, PAPERSCRIPT_TMUX_SESSION, or mcserver.",
+    )
+    parser.add_argument(
+        "--contact",
+        help="Optional legacy contact value used to build a PaperScript/<version> (<contact>) User-Agent override.",
+    )
+    parser.add_argument(
+        "--timeout",
+        type=int,
+        default=None,
+        help=f"HTTP timeout in seconds. Default: config value or {DEFAULT_TIMEOUT}.",
+    )
+    parser.add_argument(
+        "--yes",
+        action="store_true",
+        help="Accept prompts automatically where it is safe to do so.",
+    )
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Force reinstall even if the same or a newer build is already present.",
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Show what PaperScript would do without changing files or stopping servers.",
+    )
+
+    subparsers = parser.add_subparsers(dest="command")
+
+    update_parser = subparsers.add_parser("update", help="Download the latest stable Paper build when appropriate.")
+    update_parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Show what PaperScript would do without changing files or stopping servers.",
+    )
+    subparsers.add_parser("status", help="Show current server state and whether an update is available.")
+
+    list_parser = subparsers.add_parser("list-versions", help="List versions available from the API.")
+    list_parser.add_argument(
+        "--channels",
+        action="store_true",
+        help="Also show the newest build per channel for each version.",
+    )
+
+    inspect_parser = subparsers.add_parser("inspect", help="Show the latest builds for one version.")
+    inspect_parser.add_argument("version", help="Minecraft version to inspect, for example 1.20.4 or 26.1.2")
+
+    subparsers.add_parser("explore", help="Interactively pick a version, inspect it, and optionally download it.")
+
+    download_parser = subparsers.add_parser("download", help="Download a chosen version or exact build.")
+    download_parser.add_argument("--version", required=True, help="Minecraft version to download.")
+    download_parser.add_argument("--build", type=int, help="Exact build number to download.")
+    download_parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Show what PaperScript would do without changing files or stopping servers.",
+    )
+    download_parser.add_argument(
+        "--channel",
+        default=None,
+        choices=["ALPHA", "BETA", "STABLE", "RECOMMENDED", "alpha", "beta", "stable", "recommended"],
+        help="Build channel to use when --build is omitted. Default: config value or STABLE.",
+    )
+
+    return parser
+
+
+def main() -> int:
+    parser = build_parser()
+    args = parser.parse_args()
+
+    if args.command is None:
+        args.command = "update"
+
+    try:
+        app = PaperScriptApp(args)
+        if args.command == "update":
+            app.run_update()
+        elif args.command == "status":
+            app.run_status()
+        elif args.command == "list-versions":
+            app.list_versions(show_channels=args.channels)
+        elif args.command == "inspect":
+            app.inspect_version(args.version, offer_download=True)
+        elif args.command == "explore":
+            app.explore_versions()
+        elif args.command == "download":
+            selected_channel = args.channel.upper() if args.channel else app.default_channel
+            app.run_download(args.version, args.build, selected_channel)
+        else:
+            parser.print_help()
+            return 1
+        return 0
+    except KeyboardInterrupt:
+        print("\nCancelled.")
+        return 130
+    except PaperScriptError as error:
+        print(f"Error: {error}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
