@@ -29,6 +29,13 @@ DEFAULT_CHANNEL = "STABLE"
 DEFAULT_TIMEOUT = 30
 DEFAULT_USER_AGENT = f"mrfloris-PaperScript/2.0 ({PROJECT_URL})"
 CURRENT_JAR_PATTERN = re.compile(r"^paper-(.+)-(\d+)\.jar$", re.IGNORECASE)
+ANSI_RESET = "\033[0m"
+ANSI_BOLD = "\033[1m"
+ANSI_RED = "\033[31m"
+ANSI_GREEN = "\033[32m"
+ANSI_YELLOW = "\033[33m"
+ANSI_CYAN = "\033[36m"
+ANSI_MAGENTA = "\033[35m"
 DEFAULT_CONFIG: dict[str, Any] = {
     "server_name": None,
     "tmux_session": "mcserver",
@@ -144,32 +151,69 @@ def compare_versions(left: str, right: str) -> int:
     return 0
 
 
-def prompt_yes_no(question: str, default: bool = False) -> bool:
+def supports_color(stream: Any, no_color: bool = False) -> bool:
+    if no_color or os.environ.get("NO_COLOR"):
+        return False
+    return bool(getattr(stream, "isatty", lambda: False)())
+
+
+def color_text(text: str, color: str, enabled: bool, bold: bool = False) -> str:
+    if not enabled:
+        return text
+    prefix = f"{ANSI_BOLD}{color}" if bold else color
+    return f"{prefix}{text}{ANSI_RESET}"
+
+
+def prompt_yes_no(question: str, default: bool = False, logger: "Logger | None" = None) -> bool:
     suffix = "[Y/n]" if default else "[y/N]"
     while True:
-        reply = input(f"{question} {suffix} ").strip().lower()
+        prompt = f"{question} {suffix} "
+        if logger is not None:
+            reply = logger.prompt_input(prompt).strip().lower()
+        else:
+            reply = input(prompt).strip().lower()
         if not reply:
             return default
         if reply in {"y", "yes"}:
             return True
         if reply in {"n", "no"}:
             return False
-        print("Please answer yes or no.")
+        if logger is not None:
+            logger.warn("Please answer yes or no.")
+        else:
+            print("Please answer yes or no.")
 
 
-def prompt_choice(question: str, choices: list[tuple[str, str]], default: str | None = None) -> str:
-    print(question)
+def prompt_choice(
+    question: str,
+    choices: list[tuple[str, str]],
+    default: str | None = None,
+    logger: "Logger | None" = None,
+) -> str:
+    if logger is not None:
+        logger.info(question)
+    else:
+        print(question)
     for key, label in choices:
         default_mark = " (default)" if default == key else ""
-        print(f"  {key}) {label}{default_mark}")
+        if logger is not None:
+            logger.log(f"  {key}) {label}{default_mark}")
+        else:
+            print(f"  {key}) {label}{default_mark}")
     valid = {key for key, _ in choices}
     while True:
-        reply = input("> ").strip().lower()
+        if logger is not None:
+            reply = logger.prompt_input("> ").strip().lower()
+        else:
+            reply = input("> ").strip().lower()
         if not reply and default is not None:
             return default
         if reply in valid:
             return reply
-        print(f"Choose one of: {', '.join(sorted(valid))}")
+        if logger is not None:
+            logger.warn(f"Choose one of: {', '.join(sorted(valid))}")
+        else:
+            print(f"Choose one of: {', '.join(sorted(valid))}")
 
 
 def parse_properties(path: Path) -> dict[str, str]:
@@ -230,20 +274,44 @@ def sha256_file(path: Path) -> str:
 
 
 class Logger:
-    def __init__(self, log_path: Path, quiet: bool = False) -> None:
+    def __init__(self, log_path: Path, quiet: bool = False, use_color: bool = False) -> None:
         self.log_path = log_path
         self.quiet = quiet
+        self.use_color = use_color
         ensure_directory(log_path.parent)
+
+    def _console_text(self, message: str) -> str:
+        if not self.use_color:
+            return message
+        lower = message.lower()
+        if message.startswith("ERROR:") or "mismatch" in lower or "failed" in lower:
+            return color_text(message, ANSI_RED, True, bold=True)
+        if lower.startswith("downloaded to") or lower.startswith("installed ") or lower.startswith("backed up ") or "checksum verification: match" in lower or "already on the latest stable build" in lower or lower.startswith("update finished"):
+            return color_text(message, ANSI_GREEN, True, bold=True)
+        if lower.startswith("script directory:") or lower.startswith("server directory:") or lower.startswith("runtime directory:") or lower.startswith("expected sha-256:") or lower.startswith("downloaded sha-256:") or lower.startswith("current sha-256:") or lower.startswith("api expected sha-256:") or lower.startswith("paperScript version:".lower()):
+            return color_text(message, ANSI_CYAN, True)
+        if lower.startswith("dry run:") or "no newer stable build" in lower or "no download was performed" in lower or "cancelled" in lower or "force" in lower or "running" in lower or "latest stable is" in lower or "newer version available" in lower or "would ask" in lower:
+            return color_text(message, ANSI_YELLOW, True, bold=True)
+        return message
 
     def log(self, message: str) -> None:
         line = f"[{utc_now()}] {message}"
         with self.log_path.open("a", encoding="utf-8") as handle:
             handle.write(line + "\n")
         if not self.quiet:
-            print(message)
+            print(self._console_text(message))
 
     def error(self, message: str) -> None:
         self.log(f"ERROR: {message}")
+
+    def warn(self, message: str) -> None:
+        self.log(message)
+
+    def info(self, message: str) -> None:
+        self.log(message)
+
+    def prompt_input(self, message: str) -> str:
+        return input(color_text(message, ANSI_MAGENTA, self.use_color, bold=True))
 
 
 class PaperAPI:
@@ -392,7 +460,7 @@ class PaperScriptApp:
         self.backups_dir = self.runtime_dir / str(self.config["backup_dir"])
         self.downloads_dir = self.runtime_dir / str(self.config["downloads_dir"])
         self.log_path = self.runtime_dir / str(self.config["log_file"])
-        self.logger = Logger(self.log_path, quiet=False)
+        self.logger = Logger(self.log_path, quiet=False, use_color=supports_color(sys.stdout, no_color=bool(args.no_color)))
         ensure_directory(self.backups_dir)
         ensure_directory(self.downloads_dir)
         self.state = self._load_json(self.state_path)
@@ -420,6 +488,11 @@ class PaperScriptApp:
             or self.config.get("tmux_session")
             or "mcserver"
         )
+
+    def force_example_for_current(self, current: JarInfo | None) -> str | None:
+        if current is None:
+            return None
+        return f"./paperscript --force download --version {current.version} --build {current.build}"
 
     def _resolve_server_dir(self) -> Path:
         if self.args.server_dir:
@@ -589,9 +662,14 @@ class PaperScriptApp:
                 )
 
         if offer_download and sys.stdin.isatty():
-            if prompt_yes_no(f"Download a build for version {version} now?", default=False):
+            if prompt_yes_no(f"Download a build for version {version} now?", default=False, logger=self.logger):
                 choices = [(channel.lower(), channel.title()) for channel in by_channel]
-                selected = prompt_choice("Which channel do you want?", choices, default="stable" if "STABLE" in by_channel else None)
+                selected = prompt_choice(
+                    "Which channel do you want?",
+                    choices,
+                    default="stable" if "STABLE" in by_channel else None,
+                    logger=self.logger,
+                )
                 self.install_build(by_channel[selected.upper()], force_version_prompt=True)
 
     def explore_versions(self) -> None:
@@ -600,7 +678,7 @@ class PaperScriptApp:
         for index, version in enumerate(versions, start=1):
             print(f"  {index:>2}. {version}")
         while True:
-            reply = input("Pick a version number (or press Enter to cancel): ").strip()
+            reply = self.logger.prompt_input("Pick a version number (or press Enter to cancel): ").strip()
             if not reply:
                 self.logger.log("Cancelled version explorer.")
                 return
@@ -643,6 +721,11 @@ class PaperScriptApp:
                 f"Current server is already on {current.version} build #{current.build}. "
                 "No newer stable build is available, so no download was performed."
             )
+            self.logger.log("If you want to re-download this jar anyway, run one of these:")
+            self.logger.log("  ./paperscript --force update")
+            exact_force = self.force_example_for_current(current)
+            if exact_force:
+                self.logger.log(f"  {exact_force}")
             return None
 
         if version_cmp > 0:
@@ -667,6 +750,7 @@ class PaperScriptApp:
         if self.args.yes or prompt_yes_no(
             f"This is a version upgrade from {current.version} to {latest_version}. Download it?",
             default=False,
+            logger=self.logger,
         ):
             return latest_build
         self.logger.log("Skipped version upgrade by choice.")
@@ -714,6 +798,7 @@ class PaperScriptApp:
                 ("e", "Exit without changing anything"),
             ],
             default="e",
+            logger=self.logger,
         )
         if choice == "g":
             self.graceful_stop(processes)
@@ -925,7 +1010,11 @@ class PaperScriptApp:
             return
 
         if current and self.args.force and self.confirm_before_force_download and not self.args.yes and not self.args.dry_run:
-            if not prompt_yes_no("Force download is enabled. Continue with the requested install?", default=False):
+            if not prompt_yes_no(
+                "Force download is enabled. Continue with the requested install?",
+                default=False,
+                logger=self.logger,
+            ):
                 self.logger.log("Cancelled forced download.")
                 return
         elif current and self.args.force and self.confirm_before_force_download and self.args.dry_run:
@@ -935,6 +1024,7 @@ class PaperScriptApp:
             if not prompt_yes_no(
                 f"This appears to be a downgrade from version {current.version} to {build.version}. Continue?",
                 default=False,
+                logger=self.logger,
             ):
                 self.logger.log("Cancelled downgrade.")
                 return
@@ -951,6 +1041,7 @@ class PaperScriptApp:
             elif not prompt_yes_no(
                 f"This will upgrade from version {current.version} to {build.version}. Continue?",
                 default=False,
+                logger=self.logger,
             ):
                 self.logger.log("Cancelled version upgrade.")
                 return
@@ -1186,6 +1277,11 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Show what PaperScript would do without changing files or stopping servers.",
     )
+    parser.add_argument(
+        "--no-color",
+        action="store_true",
+        help="Disable ANSI colors in terminal output.",
+    )
 
     subparsers = parser.add_subparsers(dest="command")
 
@@ -1260,7 +1356,10 @@ def main() -> int:
         print("\nCancelled.")
         return 130
     except PaperScriptError as error:
-        print(f"Error: {error}", file=sys.stderr)
+        print(
+            color_text(f"Error: {error}", ANSI_RED, supports_color(sys.stderr, no_color=bool(args.no_color)), bold=True),
+            file=sys.stderr,
+        )
         return 1
 
 

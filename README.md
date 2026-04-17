@@ -50,6 +50,7 @@ Bash is still useful here as a tiny wrapper, but Python is much more maintainabl
 - Uses tmux for graceful stop, then falls back to `SIGTERM`.
 - Writes activity to `logs.log`.
 - Keeps downloads and backups inside `PaperScript/`.
+- Uses colored terminal output by default for prompts, warnings, success messages, and errors.
 
 ## Requirements
 
@@ -98,6 +99,7 @@ Examples:
 ./paperscript update
 ./paperscript --force update
 ./paperscript update --dry-run
+./paperscript --no-color update
 ./paperscript --server-dir /srv/mc/live update
 ./paperscript --yes update
 ```
@@ -227,6 +229,8 @@ Notes:
   Reinstall even if the same build is already present. Useful with `update` or `download`.
 - `--dry-run`
   Show what would happen without downloading, moving jars, pruning backups, or stopping the server.
+- `--no-color`
+  Disable ANSI colors in terminal output.
 
 ## How Server Directory Detection Works
 
