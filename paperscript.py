@@ -598,6 +598,15 @@ class PaperScriptApp:
                 return version, build
         raise PaperScriptError("No stable Paper builds were found.")
 
+    def latest_version_for_channel(self, channel: str) -> tuple[str, BuildInfo]:
+        channel_upper = channel.upper()
+        versions = [item["id"] for item in self.api.get_project_versions()]
+        for version in versions:
+            build = self.api.get_latest_build(version, channel=channel_upper)
+            if build:
+                return version, build
+        raise PaperScriptError(f"No {channel_upper} Paper builds were found.")
+
     def describe_server_context(self) -> None:
         has_server_properties = (self.server_dir / "server.properties").exists()
         current_jar = self.find_current_jar()
@@ -1121,6 +1130,7 @@ class PaperScriptApp:
         current = self.find_current_jar()
         running = self.detect_running_server_processes()
         latest_version, latest_build = self.latest_stable_version()
+        latest_experimental_version, latest_experimental_build = self.latest_version_for_channel("ALPHA")
 
         self.logger.log(f"PaperScript version: {APP_VERSION}")
         self.logger.log(f"Server directory: {self.server_dir}")
@@ -1173,7 +1183,7 @@ class PaperScriptApp:
                 self.logger.log("Update status: installed version is newer than the latest stable version this script found.")
 
         if self.status_show_all_channels:
-            self.logger.log(f"Latest channels for {latest_version}:")
+            self.logger.log(f"Latest channels for stable version {latest_version}:")
             channels = self.latest_builds_by_channel(latest_version)
             for channel in ["STABLE", "BETA", "ALPHA", "RECOMMENDED"]:
                 build = channels.get(channel)
@@ -1182,8 +1192,26 @@ class PaperScriptApp:
                         f"  - {channel}: build #{build.build_id}, {format_bytes(build.size)}"
                     )
         self.logger.log(
+            f"Latest experimental release overall: {latest_experimental_version} build #{latest_experimental_build.build_id}"
+        )
+        self.logger.log(
+            f"Use './paperscript experimental' to inspect it, or './paperscript experimental --download' to install it."
+        )
+        self.logger.log(
             f"Backup retention: keep {self.keep_backups} backups, cleanup after install {format_bool(self.cleanup_backups_after_install)}"
         )
+
+    def run_experimental(self, download: bool = False) -> None:
+        version, build = self.latest_version_for_channel("ALPHA")
+        self.logger.log(
+            f"Latest experimental release overall: {version} build #{build.build_id} ({format_bytes(build.size)})"
+        )
+        self.logger.log(f"Download URL: {build.download_url}")
+        if build.sha256:
+            self.logger.log(f"Expected SHA-256: {build.sha256}")
+        self.logger.log(f"Exact manual command: ./paperscript download --version {version} --channel ALPHA")
+        if download:
+            self.install_build(build, force_version_prompt=True)
 
     def run_verify(self) -> None:
         current = self.find_current_jar()
@@ -1306,6 +1334,15 @@ def build_parser() -> argparse.ArgumentParser:
     )
     subparsers.add_parser("status", help="Show current server state and whether an update is available.")
     subparsers.add_parser("verify", help="Verify the current jar SHA-256 against recorded state and the live API when available.")
+    experimental_parser = subparsers.add_parser(
+        "experimental",
+        help="Show or download the latest experimental Paper release overall.",
+    )
+    experimental_parser.add_argument(
+        "--download",
+        action="store_true",
+        help="Download and install the latest experimental release overall.",
+    )
 
     list_parser = subparsers.add_parser("list-versions", help="List versions available from the API.")
     list_parser.add_argument(
@@ -1352,6 +1389,8 @@ def main() -> int:
             app.run_status()
         elif args.command == "verify":
             app.run_verify()
+        elif args.command == "experimental":
+            app.run_experimental(download=args.download)
         elif args.command == "list-versions":
             app.list_versions(show_channels=args.channels)
         elif args.command == "inspect":

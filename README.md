@@ -39,6 +39,7 @@ Bash is still useful here as a tiny wrapper, but Python is much more maintainabl
 - Lets you force a specific version or exact build download.
 - Adds a `status` command to show the current state and whether an update is available.
 - Adds a `verify` command to hash the current jar and compare it with recorded and API-reported SHA-256 values.
+- Adds an `experimental` command to show or download the latest experimental Paper release overall.
 - Adds a `--dry-run` mode so you can preview actions without changing files.
 - Verifies the downloaded jar against the API-provided SHA-256 checksum before install.
 - Backs up the current Paper jar before installing a new one.
@@ -121,7 +122,8 @@ It reports:
 - whether a likely Java server process is running
 - latest stable version and build
 - whether an update is available
-- latest channel info for the newest version
+- latest channel info for the newest stable version
+- latest experimental release overall
 - expected SHA-256 from the last PaperScript install, when available
 - backup retention settings
 
@@ -147,6 +149,25 @@ Examples:
 ./paperscript verify
 ./paperscript --server-dir /srv/mc/live verify
 ```
+
+### `experimental`
+
+Shows the latest experimental Paper release overall. This is different from the alpha channel shown for the latest stable version in `status`.
+
+For example:
+
+- `Latest channels for stable version 1.21.11` means alpha, beta, and stable builds that belong to version `1.21.11`
+- `Latest experimental release overall` may instead be something newer like `26.1.2 alpha build #7`
+
+Examples:
+
+```bash
+./paperscript experimental
+./paperscript experimental --download
+./paperscript --yes experimental --download
+```
+
+If you want the exact manual install command after seeing the latest experimental version, PaperScript prints it for you.
 
 ### `list-versions`
 
