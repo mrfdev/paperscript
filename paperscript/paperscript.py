@@ -1727,7 +1727,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--force",
         action="store_true",
-        help="Force reinstall even if the same build is already present. Useful with update or download.",
+        help="Force reinstall even if the same build is already present. Useful with update, stable, experimental, or download.",
     )
     parser.add_argument(
         "--dry-run",
@@ -1849,7 +1849,20 @@ def build_parser() -> argparse.ArgumentParser:
     inspect_parser.add_argument("version", help="Minecraft version to inspect, for example 1.20.4 or 26.1.2")
 
     subparsers.add_parser("explore", help="Interactively pick a version, inspect it, and optionally download it.")
-    subparsers.add_parser("init", help="Create or repair the PaperScript runtime files in paperscript/ with confirmation.")
+    init_parser = subparsers.add_parser(
+        "init",
+        help="Create or repair the PaperScript runtime files in paperscript/ with confirmation.",
+    )
+    init_parser.add_argument(
+        "--yes",
+        action="store_true",
+        help="Skip the init confirmation prompt.",
+    )
+    init_parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Show what init would create without writing files.",
+    )
 
     download_parser = subparsers.add_parser("download", help="Download a chosen version or exact build.")
     download_parser.add_argument("--version", required=True, help="Minecraft version to download.")
