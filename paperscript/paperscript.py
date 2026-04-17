@@ -31,6 +31,19 @@ PAPER_DOWNLOADS_URL = "https://papermc.io/downloads/paper"
 DEFAULT_CHANNEL = "STABLE"
 DEFAULT_TIMEOUT = 30
 DEFAULT_USER_AGENT = f"mrfloris-PaperScript/2.0 ({PROJECT_URL})"
+COMMAND_NAMES = {
+    "update",
+    "status",
+    "verify",
+    "stable",
+    "experimental",
+    "cleanup",
+    "list-versions",
+    "inspect",
+    "explore",
+    "init",
+    "download",
+}
 CURRENT_JAR_PATTERN = re.compile(r"^paper-(.+)-(\d+)\.jar$", re.IGNORECASE)
 ANSI_RESET = "\033[0m"
 ANSI_BOLD = "\033[1m"
@@ -430,7 +443,10 @@ class Logger:
             raise PaperScriptError(
                 "A prompt was required, but no interactive terminal is available. Re-run with --yes or adjust config."
             )
-        return input(color_text(message, self.theme["prompt"], self.use_color, bold=True))
+        try:
+            return input(color_text(message, self.theme["prompt"], self.use_color, bold=True))
+        except EOFError as error:
+            raise PaperScriptError("Input stream closed while waiting for a reply. PaperScript cancelled the prompt.") from error
 
 
 class PaperAPI:
@@ -488,7 +504,17 @@ class PaperAPI:
         return sorted(flattened, key=lambda item: parse_version(item["id"]).key(), reverse=True)
 
     def get_builds(self, version: str) -> list[BuildInfo]:
-        raw = self._request_json(f"{API_ROOT}/versions/{version}/builds")
+        try:
+            raw = self._request_json(f"{API_ROOT}/versions/{version}/builds")
+        except PaperScriptError as error:
+            detail = str(error).lower()
+            if "version_not_found" in detail or "no version was found with the given identifier" in detail:
+                raise PaperScriptError(
+                    f"Paper version '{version}' was not found by the API. "
+                    "Try './paperscript.sh list-versions --channels' to browse available versions, "
+                    "or './paperscript.sh experimental' for the latest experimental release."
+                ) from error
+            raise
         builds = raw.get("builds") if isinstance(raw, dict) else raw
         if not isinstance(builds, list):
             raise PaperScriptError(f"Unexpected build payload for version {version}")
@@ -577,6 +603,51 @@ def normalize_choice(value: Any, allowed: set[str], default: str) -> str:
 def resolve_color_theme(name: Any) -> dict[str, str]:
     normalized = normalize_choice(name, set(COLOR_THEMES), "default")
     return COLOR_THEMES[normalized]
+
+
+def normalize_global_options(argv: list[str]) -> list[str]:
+    global_flags = {"--yes", "--force", "--dry-run", "--quiet", "--no-color"}
+    global_value_options = {"--server-dir", "--user-agent", "--tmux-session", "--contact", "--timeout"}
+    command_index: int | None = None
+    for index, token in enumerate(argv):
+        if token in COMMAND_NAMES:
+            command_index = index
+            break
+    if command_index is None:
+        return argv
+
+    before = list(argv[:command_index])
+    command = argv[command_index]
+    after = argv[command_index + 1 :]
+    moved: list[str] = []
+    kept: list[str] = []
+    index = 0
+    while index < len(after):
+        token = after[index]
+        if token in global_flags:
+            moved.append(token)
+            index += 1
+            continue
+        if token in global_value_options:
+            moved.append(token)
+            if index + 1 < len(after):
+                moved.append(after[index + 1])
+                index += 2
+            else:
+                index += 1
+            continue
+        matched_inline = False
+        for option in global_value_options:
+            if token.startswith(f"{option}="):
+                moved.append(token)
+                matched_inline = True
+                break
+        if matched_inline:
+            index += 1
+            continue
+        kept.append(token)
+        index += 1
+    return before + moved + [command] + kept
 
 
 class PaperScriptApp:
@@ -668,6 +739,15 @@ class PaperScriptApp:
     def log_release_page(self, relevant: bool = False) -> None:
         if self.should_show_release_link(relevant):
             self.logger.log(f"Release page: {PAPER_DOWNLOADS_URL}")
+
+    def format_browser_entry(self, prefix: str, value: str, suffix: str = "") -> str:
+        if not self.logger.use_color:
+            return f"{prefix}{value}{suffix}"
+        theme = self.logger.theme
+        rendered_prefix = color_text(prefix, theme["key"], True)
+        rendered_value = color_text(value, theme["value"], True, bold=True)
+        rendered_suffix = color_text(suffix, theme["key"], True) if suffix else ""
+        return f"{rendered_prefix}{rendered_value}{rendered_suffix}"
 
     def _resolve_server_dir(self) -> Path:
         if self.args.server_dir:
@@ -810,9 +890,9 @@ class PaperScriptApp:
                 if summaries:
                     extra.append(", ".join(summaries))
             if extra:
-                self.logger.log(f"  - {line} ({'; '.join(extra)})")
+                self.logger.log(self.format_browser_entry("  - ", line, f" ({'; '.join(extra)})"))
             else:
-                self.logger.log(f"  - {line}")
+                self.logger.log(self.format_browser_entry("  - ", line))
 
     def latest_channel_summaries(self, version: str) -> list[str]:
         builds = self.api.get_builds(version)
@@ -865,9 +945,9 @@ class PaperScriptApp:
 
     def explore_versions(self) -> None:
         versions = [item["id"] for item in self.api.get_project_versions()]
-        print("Available versions:")
+        self.console_only("Available versions:")
         for index, version in enumerate(versions, start=1):
-            print(f"  {index:>2}. {version}")
+            self.console_only(self.format_browser_entry(f"  {index:>2}. ", version))
         while True:
             reply = self.logger.prompt_input("Pick a version number (or press Enter to cancel): ").strip()
             if not reply:
@@ -877,7 +957,7 @@ class PaperScriptApp:
                 selected = versions[int(reply) - 1]
                 self.inspect_version(selected, offer_download=True)
                 return
-            print("Please enter one of the listed numbers.")
+            self.console_only("Please enter one of the listed numbers.")
 
     def choose_target_for_update(self) -> BuildInfo | None:
         current = self.find_current_jar()
@@ -1232,7 +1312,7 @@ class PaperScriptApp:
             ):
                 self.logger.log("Cancelled forced download.")
                 return
-        elif current and force_requested and self.confirm_before_force_download and self.args.dry_run:
+        elif current and force_requested and self.confirm_before_force_download and self.args.dry_run and not self.args.yes:
             self.logger.log("Dry run: PaperScript would ask for confirmation before a forced download.")
 
         if current and compare_versions(current.version, build.version) > 0 and self.confirm_before_downgrade and not self.args.yes and not self.args.dry_run:
@@ -1243,7 +1323,13 @@ class PaperScriptApp:
             ):
                 self.logger.log("Cancelled downgrade.")
                 return
-        elif current and compare_versions(current.version, build.version) > 0 and self.confirm_before_downgrade and self.args.dry_run:
+        elif (
+            current
+            and compare_versions(current.version, build.version) > 0
+            and self.confirm_before_downgrade
+            and self.args.dry_run
+            and not self.args.yes
+        ):
             self.logger.log(
                 f"Dry run: PaperScript would ask before downgrading from {current.version} to {build.version}."
             )
@@ -1314,13 +1400,19 @@ class PaperScriptApp:
             builds = self.api.get_builds(version)
             selected = next((build for build in builds if build.build_id == build_id), None)
             if not selected:
-                raise PaperScriptError(f"Build #{build_id} was not found for version {version}")
+                raise PaperScriptError(
+                    f"Build #{build_id} was not found for version {version}. "
+                    f"Try './paperscript.sh inspect {version}' to see the available builds first."
+                )
             self.install_build(selected, force_version_prompt=True, prompt_for_force_reinstall=True)
             return
 
         selected = self.api.get_latest_build(version, channel=channel)
         if not selected:
-            raise PaperScriptError(f"No {channel.upper()} build was found for version {version}")
+            raise PaperScriptError(
+                f"No {channel.upper()} build was found for version {version}. "
+                f"Try './paperscript.sh inspect {version}' to see which channels exist."
+            )
         self.install_build(selected, force_version_prompt=True, prompt_for_force_reinstall=True)
 
     def run_status(self) -> None:
@@ -1331,6 +1423,7 @@ class PaperScriptApp:
         latest_version, latest_build = self.latest_stable_version()
         latest_experimental_version, latest_experimental_build = self.latest_version_for_channel("ALPHA")
         tmux_available = self.tmux_session_available()
+        backup_count = self.backup_file_count()
         update_relevant = current is None
 
         self.logger.kv("PaperScript version", APP_RELEASE)
@@ -1432,6 +1525,18 @@ class PaperScriptApp:
             "Backup retention",
             f"keep {self.keep_backups} backups, cleanup after install {format_bool(self.cleanup_backups_after_install)}",
         )
+        self.logger.kv("Backups found", f"{backup_count} file(s)")
+        if backup_count > 0:
+            if self.keep_backups >= 0 and backup_count > self.keep_backups:
+                self.log_command_hint(
+                    f"Run './paperscript.sh cleanup --backups --keep {self.keep_backups}' to trim older backups, "
+                    "or './paperscript.sh cleanup --backups' to delete them all.",
+                    important=True,
+                )
+            elif not compact:
+                self.log_command_hint(
+                    "Run './paperscript.sh cleanup --backups' to delete all backup jars if you no longer need rollback copies."
+                )
 
     def run_stable(self, download: bool = False) -> None:
         version, build = self.latest_stable_version()
@@ -1513,12 +1618,16 @@ class PaperScriptApp:
 
     def cleanup_selection(self) -> dict[str, bool]:
         selected = {
+            "all": bool(getattr(self.args, "cleanup_all", False)),
             "downloads": bool(getattr(self.args, "cleanup_downloads", False)),
             "backups": bool(getattr(self.args, "cleanup_backups", False)),
             "pycache": bool(getattr(self.args, "cleanup_pycache", False)),
             "logs": bool(getattr(self.args, "cleanup_logs", False)),
             "json": bool(getattr(self.args, "cleanup_json", False)),
         }
+        if selected["all"]:
+            for key in ["downloads", "backups", "pycache", "logs", "json"]:
+                selected[key] = True
         if getattr(self.args, "cleanup_keep", None) is not None:
             selected["backups"] = True
         if not any(selected.values()):
@@ -1560,6 +1669,11 @@ class PaperScriptApp:
 
     def find_pycache_dirs(self) -> list[Path]:
         return [path for path in self.runtime_dir.rglob("__pycache__") if path.is_dir()]
+
+    def backup_file_count(self) -> int:
+        if not self.backups_dir.exists():
+            return 0
+        return sum(1 for path in self.backups_dir.iterdir() if path.is_file())
 
     def trim_backups_to_keep(self, keep: int) -> int:
         if keep < 0:
@@ -1747,12 +1861,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     subparsers = parser.add_subparsers(dest="command")
 
-    update_parser = subparsers.add_parser("update", help="Download the latest stable Paper build when appropriate.")
-    update_parser.add_argument(
-        "--dry-run",
-        action="store_true",
-        help="Show what PaperScript would do without changing files or stopping servers.",
-    )
+    subparsers.add_parser("update", help="Download the latest stable Paper build when appropriate.")
     status_parser = subparsers.add_parser("status", help="Show current server state and whether an update is available.")
     status_parser.add_argument(
         "--compact",
@@ -1788,6 +1897,12 @@ def build_parser() -> argparse.ArgumentParser:
     cleanup_parser = subparsers.add_parser(
         "cleanup",
         help="Remove selected runtime files such as downloads, backups, __pycache__, logs, or JSON state/config.",
+    )
+    cleanup_parser.add_argument(
+        "--all",
+        dest="cleanup_all",
+        action="store_true",
+        help="Clean downloads, backups, __pycache__, logs, and JSON state/config together.",
     )
     cleanup_parser.add_argument(
         "--downloads",
@@ -1827,16 +1942,6 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Delete config.json and state.json so the next run starts fresh.",
     )
-    cleanup_parser.add_argument(
-        "--yes",
-        action="store_true",
-        help="Skip the cleanup confirmation prompt.",
-    )
-    cleanup_parser.add_argument(
-        "--dry-run",
-        action="store_true",
-        help="Show what cleanup would delete without removing anything.",
-    )
 
     list_parser = subparsers.add_parser("list-versions", help="List versions available from the API.")
     list_parser.add_argument(
@@ -1853,25 +1958,10 @@ def build_parser() -> argparse.ArgumentParser:
         "init",
         help="Create or repair the PaperScript runtime files in paperscript/ with confirmation.",
     )
-    init_parser.add_argument(
-        "--yes",
-        action="store_true",
-        help="Skip the init confirmation prompt.",
-    )
-    init_parser.add_argument(
-        "--dry-run",
-        action="store_true",
-        help="Show what init would create without writing files.",
-    )
 
     download_parser = subparsers.add_parser("download", help="Download a chosen version or exact build.")
     download_parser.add_argument("--version", required=True, help="Minecraft version to download.")
     download_parser.add_argument("--build", type=int, help="Exact build number to download.")
-    download_parser.add_argument(
-        "--dry-run",
-        action="store_true",
-        help="Show what PaperScript would do without changing files or stopping servers.",
-    )
     download_parser.add_argument(
         "--channel",
         default=None,
@@ -1884,7 +1974,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main() -> int:
     parser = build_parser()
-    args = parser.parse_args()
+    args = parser.parse_args(normalize_global_options(sys.argv[1:]))
 
     if args.command is None:
         args.command = "update"

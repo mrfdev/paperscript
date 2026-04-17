@@ -161,6 +161,7 @@ The normal full view can include:
 - newest channels for the current stable version
 - newest experimental release overall
 - backup retention settings
+- backup file count and cleanup suggestions when useful
 
 Status views:
 
@@ -191,6 +192,7 @@ Examples:
 ./paperscript.sh stable
 ./paperscript.sh stable --download
 ./paperscript.sh --force stable --download
+./paperscript.sh stable --download --yes --force
 ```
 
 ### `experimental`
@@ -210,6 +212,7 @@ Examples:
 ./paperscript.sh experimental
 ./paperscript.sh experimental --download
 ./paperscript.sh --yes experimental --download
+./paperscript.sh experimental --download --yes
 ```
 
 ### `verify`
@@ -285,6 +288,7 @@ Examples:
 ./paperscript.sh download --version 26.2.1 --channel BETA
 ./paperscript.sh --force download --version 26.1.2
 ./paperscript.sh --force download --version 1.21.11 --build 130
+./paperscript.sh download --version 1.21.11 --build 130 --force --yes
 ```
 
 Notes:
@@ -314,6 +318,8 @@ Targets:
   Clean backup jars
 - `--backups --keep N`
   Keep the newest `N` backups and remove older ones
+- `--all`
+  Clean downloads, backups, `__pycache__`, logs, and JSON state/config together
 - `--pycache`
   Delete Python `__pycache__/` folders
 - `--logs`
@@ -332,6 +338,7 @@ Examples:
 
 ```bash
 ./paperscript.sh cleanup
+./paperscript.sh cleanup --all
 ./paperscript.sh cleanup --downloads
 ./paperscript.sh cleanup --backups
 ./paperscript.sh cleanup --backups --keep 10
@@ -387,6 +394,13 @@ Examples:
   Suppress normal console output. Logs still go to `paperscript/logs.log`.
 - `--no-color`
   Disable ANSI colors in terminal output.
+
+PaperScript also accepts these global flags after the command, so both styles work:
+
+```bash
+./paperscript.sh --yes --force stable --download
+./paperscript.sh stable --download --yes --force
+```
 
 For cron or scheduled tasks, the safest pattern is usually:
 
@@ -546,6 +560,7 @@ If you already have a jar installed but want the same file again anyway, use one
 ./paperscript.sh --force stable --download
 ./paperscript.sh --force experimental --download
 ./paperscript.sh --force download --version 1.21.11 --build 130
+./paperscript.sh stable --download --yes --force
 ```
 
 Inside `inspect` and `explore`, PaperScript can also offer:
@@ -597,6 +612,17 @@ Target a separate server directory:
 ```bash
 ./paperscript.sh --server-dir /Users/you/minecraft/test-server update
 ```
+
+## Todo
+
+PaperScript keeps a live local todo file at [paperscript/todo.log](./paperscript/todo.log) for deferred ideas that are not implemented yet.
+
+Current queued ideas include:
+
+- optional update scheduling or smarter unattended workflows
+- extra selective cleanup and repair helpers
+- richer tmux and server control helpers such as start, stop, and restart
+- additional smoke-test or planner-style validation modes
 
 ## API Notes
 
