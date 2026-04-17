@@ -22,7 +22,9 @@ from urllib.request import Request, urlopen
 
 
 APP_NAME = "PaperScript"
-APP_VERSION = "0.1.0"
+APP_VERSION = "5.0.0"
+APP_BUILD = "048"
+APP_RELEASE = f"{APP_VERSION} build {APP_BUILD}"
 API_ROOT = "https://fill.papermc.io/v3/projects/paper"
 PROJECT_URL = "https://github.com/mrfdev/PaperScript"
 DEFAULT_CHANNEL = "STABLE"
@@ -31,11 +33,14 @@ DEFAULT_USER_AGENT = f"mrfloris-PaperScript/2.0 ({PROJECT_URL})"
 CURRENT_JAR_PATTERN = re.compile(r"^paper-(.+)-(\d+)\.jar$", re.IGNORECASE)
 ANSI_RESET = "\033[0m"
 ANSI_BOLD = "\033[1m"
+ANSI_DIM = "\033[2m"
 ANSI_RED = "\033[31m"
 ANSI_GREEN = "\033[32m"
 ANSI_YELLOW = "\033[33m"
 ANSI_CYAN = "\033[36m"
+ANSI_BRIGHT_CYAN = "\033[96m"
 ANSI_MAGENTA = "\033[35m"
+ANSI_BRIGHT_WHITE = "\033[97m"
 DEFAULT_CONFIG: dict[str, Any] = {
     "server_name": None,
     "tmux_session": "mcserver",
@@ -164,6 +169,15 @@ def color_text(text: str, color: str, enabled: bool, bold: bool = False) -> str:
     return f"{prefix}{text}{ANSI_RESET}"
 
 
+def style_key_value(message: str, enabled: bool, label_color: str = "") -> str:
+    if not enabled or ": " not in message:
+        return message
+    label, value = message.split(": ", 1)
+    label_prefix = label_color if label_color else ANSI_BRIGHT_CYAN
+    value_prefix = ANSI_BOLD + ANSI_BRIGHT_WHITE
+    return f"{label_prefix}{label}:{ANSI_RESET} {value_prefix}{value}{ANSI_RESET}"
+
+
 def prompt_yes_no(question: str, default: bool = False, logger: "Logger | None" = None) -> bool:
     suffix = "[Y/n]" if default else "[y/N]"
     while True:
@@ -286,12 +300,18 @@ class Logger:
         lower = message.lower()
         if message.startswith("ERROR:") or "mismatch" in lower or "failed" in lower:
             return color_text(message, ANSI_RED, True, bold=True)
-        if lower.startswith("downloaded to") or lower.startswith("installed ") or lower.startswith("backed up ") or "checksum verification: match" in lower or "already on the latest stable build" in lower or lower.startswith("update finished"):
+        if lower.startswith("downloaded to") or lower.startswith("installed ") or lower.startswith("backed up "):
             return color_text(message, ANSI_GREEN, True, bold=True)
-        if lower.startswith("script directory:") or lower.startswith("server directory:") or lower.startswith("runtime directory:") or lower.startswith("expected sha-256:") or lower.startswith("downloaded sha-256:") or lower.startswith("current sha-256:") or lower.startswith("api expected sha-256:") or lower.startswith("paperScript version:".lower()):
-            return color_text(message, ANSI_CYAN, True)
-        if lower.startswith("dry run:") or "no newer stable build" in lower or "no download was performed" in lower or "cancelled" in lower or "force" in lower or "running" in lower or "latest stable is" in lower or "newer version available" in lower or "would ask" in lower:
+        if "checksum verification: match" in lower:
+            return style_key_value(message, True, ANSI_GREEN)
+        if lower.startswith("update status:"):
+            return style_key_value(message, True, ANSI_GREEN if "latest stable build" in lower else ANSI_YELLOW)
+        if lower.startswith("running server detected:"):
+            return style_key_value(message, True, ANSI_YELLOW)
+        if lower.startswith("dry run:") or "no newer stable build" in lower or "no download was performed" in lower or "cancelled" in lower or "force" in lower or "latest stable is" in lower or "newer version available" in lower or "would ask" in lower:
             return color_text(message, ANSI_YELLOW, True, bold=True)
+        if ": " in message:
+            return style_key_value(message, True, ANSI_CYAN)
         return message
 
     def log(self, message: str) -> None:
@@ -309,6 +329,9 @@ class Logger:
 
     def info(self, message: str) -> None:
         self.log(message)
+
+    def kv(self, label: str, value: str, width: int = 28) -> None:
+        self.log(f"{label:<{width}}: {value}")
 
     def prompt_input(self, message: str) -> str:
         if not sys.stdin.isatty():
@@ -1160,55 +1183,73 @@ class PaperScriptApp:
         latest_version, latest_build = self.latest_stable_version()
         latest_experimental_version, latest_experimental_build = self.latest_version_for_channel("ALPHA")
 
-        self.logger.log(f"PaperScript version: {APP_VERSION}")
-        self.logger.log(f"Server directory: {self.server_dir}")
-        self.logger.log(f"Runtime directory: {self.runtime_dir}")
-        self.logger.log(f"Server label: {self.server_name or 'none'}")
-        self.logger.log(f"tmux session: {self.tmux_session}")
-        self.logger.log(f"Server properties found: {format_bool((self.server_dir / 'server.properties').exists())}")
-        self.logger.log(f"Configured server port: {properties.get('server-port', '25565')}")
-        self.logger.log(f"Running server detected: {format_bool(bool(running))}")
+        self.logger.kv("PaperScript version", APP_RELEASE)
+        self.logger.kv("Server directory", str(self.server_dir))
+        self.logger.kv("Runtime directory", str(self.runtime_dir))
+        self.logger.kv("Server label", str(self.server_name or "none"))
+        self.logger.kv("tmux session", self.tmux_session)
+        self.logger.kv("Server properties found", format_bool((self.server_dir / "server.properties").exists()))
+        self.logger.kv("Configured server port", properties.get("server-port", "25565"))
+        self.logger.kv("Running server detected", format_bool(bool(running)))
         if running:
             for pid, command in running:
-                self.logger.log(f"  - PID {pid}: {command}")
+                self.logger.kv(f"  PID {pid}", command)
         if current:
-            self.logger.log(
-                f"Current jar: {current.path.name} (version {current.version}, build #{current.build})"
+            self.logger.kv(
+                "Current jar",
+                f"{current.path.name} (version {current.version}, build #{current.build})",
             )
             current_sha = sha256_file(current.path)
-            self.logger.log(f"Current jar SHA-256: {current_sha}")
+            self.logger.kv("Current jar SHA-256", current_sha)
             expected_sha = self.state.get("expected_sha256")
             state_jar = self.state.get("current_jar")
             if expected_sha and state_jar == current.path.name:
-                self.logger.log(f"Expected SHA-256 from last install: {expected_sha}")
-                self.logger.log(
-                    f"Current SHA-256 matches expected: {format_bool(current_sha.lower() == str(expected_sha).lower())}"
+                self.logger.kv("Expected SHA-256", str(expected_sha))
+                self.logger.kv(
+                    "Current SHA matches expected",
+                    format_bool(current_sha.lower() == str(expected_sha).lower()),
                 )
         else:
-            self.logger.log("Current jar: none")
+            self.logger.kv("Current jar", "none")
 
+        self.logger.kv(
+            f"Latest {self.check_latest_channel_only.lower()} release",
+            f"{latest_version} build #{latest_build.build_id}",
+        )
         self.logger.log(
-            f"Latest {self.check_latest_channel_only.lower()} release: {latest_version} build #{latest_build.build_id}"
+            "Use './paperscript.sh update' to install the latest stable release, "
+            "or './paperscript.sh --force update' to re-download it even if it is already installed."
         )
         if current is None:
-            self.logger.log("Update status: no installed jar detected, so PaperScript would offer the latest release.")
+            self.logger.kv(
+                "Update status",
+                "no installed jar detected, so PaperScript would offer the latest release.",
+            )
         else:
             version_cmp = compare_versions(current.version, latest_version)
             if version_cmp == 0:
                 if latest_build.build_id > current.build:
-                    self.logger.log(
-                        f"Update status: newer build available for the same version ({current.build} -> {latest_build.build_id})."
+                    self.logger.kv(
+                        "Update status",
+                        f"newer build available for the same version ({current.build} -> {latest_build.build_id}).",
                     )
                 elif latest_build.build_id == current.build:
-                    self.logger.log("Update status: already on the latest stable build.")
+                    self.logger.kv("Update status", "already on the latest stable build.")
                 else:
-                    self.logger.log("Update status: installed build is newer than the latest stable build this script found.")
+                    self.logger.kv(
+                        "Update status",
+                        "installed build is newer than the latest stable build this script found.",
+                    )
             elif version_cmp < 0:
-                self.logger.log(
-                    f"Update status: newer version available ({current.version} -> {latest_version})."
+                self.logger.kv(
+                    "Update status",
+                    f"newer version available ({current.version} -> {latest_version}).",
                 )
             else:
-                self.logger.log("Update status: installed version is newer than the latest stable version this script found.")
+                self.logger.kv(
+                    "Update status",
+                    "installed version is newer than the latest stable version this script found.",
+                )
 
         if self.status_show_all_channels:
             self.logger.log(f"Latest channels for stable version {latest_version}:")
@@ -1216,17 +1257,21 @@ class PaperScriptApp:
             for channel in ["STABLE", "BETA", "ALPHA", "RECOMMENDED"]:
                 build = channels.get(channel)
                 if build:
-                    self.logger.log(
-                        f"  - {channel}: build #{build.build_id}, {format_bytes(build.size)}"
+                    self.logger.kv(
+                        f"  {channel}",
+                        f"build #{build.build_id}, {format_bytes(build.size)}",
+                        width=14,
                     )
-        self.logger.log(
-            f"Latest experimental release overall: {latest_experimental_version} build #{latest_experimental_build.build_id}"
+        self.logger.kv(
+            "Latest experimental release",
+            f"{latest_experimental_version} build #{latest_experimental_build.build_id}",
         )
         self.logger.log(
             "Use './paperscript.sh experimental' to inspect it, or './paperscript.sh experimental --download' to install it."
         )
-        self.logger.log(
-            f"Backup retention: keep {self.keep_backups} backups, cleanup after install {format_bool(self.cleanup_backups_after_install)}"
+        self.logger.kv(
+            "Backup retention",
+            f"keep {self.keep_backups} backups, cleanup after install {format_bool(self.cleanup_backups_after_install)}",
         )
 
     def run_experimental(self, download: bool = False) -> None:

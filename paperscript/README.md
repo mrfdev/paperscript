@@ -125,6 +125,7 @@ It reports:
 - whether an update is available
 - latest channel info for the newest stable version
 - latest experimental release overall
+- direct command hints for installing the latest stable or latest experimental release
 - expected SHA-256 from the last PaperScript install, when available
 - backup retention settings
 
