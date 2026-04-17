@@ -1,0 +1,22 @@
+{
+  "server_name": null,
+  "tmux_session": "mcserver",
+  "default_channel": "STABLE",
+  "check_latest_channel_only": "STABLE",
+  "allow_cross_version_auto_upgrade": false,
+  "allow_same_version_build_upgrade": true,
+  "keep_backups": 10,
+  "cleanup_backups_after_install": true,
+  "running_server_action": "ask",
+  "graceful_stop_command": "stop",
+  "http_timeout_seconds": 30,
+  "status_show_all_channels": true,
+  "download_filename_pattern": "Paper-{version}-{build}.jar",
+  "log_file": "logs.log",
+  "backup_dir": "backups",
+  "downloads_dir": "downloads",
+  "confirm_before_force_download": true,
+  "confirm_before_downgrade": true,
+  "auto_detect_server_by_port": true,
+  "fallback_process_detection": true
+}

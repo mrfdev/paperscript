@@ -78,6 +78,8 @@ mrfloris-PaperScript/2.0 (https://github.com/mrfdev/PaperScript)
 
 If you ever want to override that, you can still use `--user-agent` or `PAPERSCRIPT_USER_AGENT`.
 
+PaperScript also keeps `config.json` local to each machine and server. The repo includes a tracked template in [config.example.json](./config.example.json), while your real `config.json` stays ignored by git on purpose.
+
 ## Commands
 
 ### `update`
@@ -279,6 +281,8 @@ PaperScript writes and stores:
   Append-only activity log
 - `config.json`
   Generated config file with defaults for tmux, backups, channel choices, and related behavior
+- `config.example.json`
+  Tracked config template for the repository
 - `state.json`
   Last installed jar information
 - `downloads/`
@@ -288,9 +292,17 @@ PaperScript writes and stores:
 
 These are ignored by git through `.gitignore`.
 
+That means:
+
+- `config.example.json` belongs in the repo
+- `config.json` stays local on each server
+- different servers can safely use different settings without creating git noise
+
 ## Config Defaults
 
 PaperScript creates `config.json` automatically if it does not exist yet.
+
+If you want a visible starting point in the repo, use `config.example.json` as the template and keep your real `config.json` local.
 
 The current default config is:
 
