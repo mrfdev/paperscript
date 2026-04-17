@@ -18,5 +18,11 @@
   "confirm_before_force_download": true,
   "confirm_before_downgrade": true,
   "auto_detect_server_by_port": true,
-  "fallback_process_detection": true
+  "fallback_process_detection": true,
+  "quiet": false,
+  "no_color": false,
+  "color_theme": "default",
+  "default_status_view": "full",
+  "command_hint_mode": "auto",
+  "release_link_mode": "auto"
 }

@@ -1,5 +1,6 @@
 # Python
 __pycache__/
+paperscript/**/__pycache__/
 *.py[cod]
 
 # Server jars
@@ -11,6 +12,11 @@ downloads/
 logs.log
 config.json
 state.json
+paperscript/backups/
+paperscript/downloads/
+paperscript/logs.log
+paperscript/config.json
+paperscript/state.json
 
 # macOS
 .DS_Store

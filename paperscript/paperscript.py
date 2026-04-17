@@ -22,11 +22,12 @@ from urllib.request import Request, urlopen
 
 
 APP_NAME = "PaperScript"
-APP_VERSION = "5.0.0"
-APP_BUILD = "048"
+APP_VERSION = "5.0.1"
+APP_BUILD = "049"
 APP_RELEASE = f"{APP_VERSION} build {APP_BUILD}"
 API_ROOT = "https://fill.papermc.io/v3/projects/paper"
 PROJECT_URL = "https://github.com/mrfdev/PaperScript"
+PAPER_DOWNLOADS_URL = "https://papermc.io/downloads/paper"
 DEFAULT_CHANNEL = "STABLE"
 DEFAULT_TIMEOUT = 30
 DEFAULT_USER_AGENT = f"mrfloris-PaperScript/2.0 ({PROJECT_URL})"
@@ -41,6 +42,42 @@ ANSI_CYAN = "\033[36m"
 ANSI_BRIGHT_CYAN = "\033[96m"
 ANSI_MAGENTA = "\033[35m"
 ANSI_BRIGHT_WHITE = "\033[97m"
+COLOR_THEMES: dict[str, dict[str, str]] = {
+    "default": {
+        "key": ANSI_BRIGHT_CYAN,
+        "value": ANSI_BRIGHT_WHITE,
+        "success": ANSI_GREEN,
+        "warning": ANSI_YELLOW,
+        "error": ANSI_RED,
+        "prompt": ANSI_MAGENTA,
+        "hint": ANSI_YELLOW,
+    },
+    "soft": {
+        "key": ANSI_CYAN,
+        "value": ANSI_BRIGHT_WHITE,
+        "success": ANSI_GREEN,
+        "warning": ANSI_YELLOW,
+        "error": ANSI_RED,
+        "prompt": ANSI_MAGENTA,
+        "hint": ANSI_YELLOW,
+    },
+    "high-contrast": {
+        "key": ANSI_BRIGHT_WHITE,
+        "value": ANSI_BRIGHT_WHITE,
+        "success": ANSI_GREEN,
+        "warning": ANSI_YELLOW,
+        "error": ANSI_RED,
+        "prompt": ANSI_MAGENTA,
+        "hint": ANSI_YELLOW,
+    },
+}
+TODO_TEMPLATE = """PaperScript todo
+
+- Future automation: optional update scheduling or smarter unattended workflows.
+- Future cleanup polish: extra selective cleanup and repair helpers beyond the current safe set.
+- Future tmux/server control: start, stop, restart, and richer session management helpers.
+- Future validation mode: additional smoke-test or planner mode beyond today's dry-run behavior.
+"""
 DEFAULT_CONFIG: dict[str, Any] = {
     "server_name": None,
     "tmux_session": "mcserver",
@@ -62,6 +99,12 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "confirm_before_downgrade": True,
     "auto_detect_server_by_port": True,
     "fallback_process_detection": True,
+    "quiet": False,
+    "no_color": False,
+    "color_theme": "default",
+    "default_status_view": "full",
+    "command_hint_mode": "auto",
+    "release_link_mode": "auto",
 }
 
 
@@ -169,12 +212,17 @@ def color_text(text: str, color: str, enabled: bool, bold: bool = False) -> str:
     return f"{prefix}{text}{ANSI_RESET}"
 
 
-def style_key_value(message: str, enabled: bool, label_color: str = "") -> str:
+def style_key_value(
+    message: str,
+    enabled: bool,
+    label_color: str = "",
+    value_color: str = ANSI_BRIGHT_WHITE,
+) -> str:
     if not enabled or ": " not in message:
         return message
     label, value = message.split(": ", 1)
     label_prefix = label_color if label_color else ANSI_BRIGHT_CYAN
-    value_prefix = ANSI_BOLD + ANSI_BRIGHT_WHITE
+    value_prefix = ANSI_BOLD + value_color
     return f"{label_prefix}{label}:{ANSI_RESET} {value_prefix}{value}{ANSI_RESET}"
 
 
@@ -288,30 +336,74 @@ def sha256_file(path: Path) -> str:
 
 
 class Logger:
-    def __init__(self, log_path: Path, quiet: bool = False, use_color: bool = False) -> None:
+    def __init__(
+        self,
+        log_path: Path,
+        quiet: bool = False,
+        use_color: bool = False,
+        theme_name: str = "default",
+    ) -> None:
         self.log_path = log_path
         self.quiet = quiet
         self.use_color = use_color
+        self.theme = resolve_color_theme(theme_name)
         ensure_directory(log_path.parent)
 
     def _console_text(self, message: str) -> str:
         if not self.use_color:
             return message
         lower = message.lower()
+        theme = self.theme
         if message.startswith("ERROR:") or "mismatch" in lower or "failed" in lower:
-            return color_text(message, ANSI_RED, True, bold=True)
-        if lower.startswith("downloaded to") or lower.startswith("installed ") or lower.startswith("backed up "):
-            return color_text(message, ANSI_GREEN, True, bold=True)
+            return color_text(message, theme["error"], True, bold=True)
+        if (
+            lower.startswith("downloaded to")
+            or lower.startswith("installed ")
+            or lower.startswith("backed up ")
+            or lower.startswith("cleanup finished:")
+            or lower.startswith("server stopped")
+            or lower.startswith("server force-stopped")
+        ):
+            return color_text(message, theme["success"], True, bold=True)
         if "checksum verification: match" in lower:
-            return style_key_value(message, True, ANSI_GREEN)
+            return style_key_value(message, True, theme["success"], theme["value"])
         if lower.startswith("update status:"):
-            return style_key_value(message, True, ANSI_GREEN if "latest stable build" in lower else ANSI_YELLOW)
+            return style_key_value(
+                message,
+                True,
+                theme["success"] if "latest stable build" in lower else theme["warning"],
+                theme["value"],
+            )
         if lower.startswith("running server detected:"):
-            return style_key_value(message, True, ANSI_YELLOW)
-        if lower.startswith("dry run:") or "no newer stable build" in lower or "no download was performed" in lower or "cancelled" in lower or "force" in lower or "latest stable is" in lower or "newer version available" in lower or "would ask" in lower:
-            return color_text(message, ANSI_YELLOW, True, bold=True)
+            return style_key_value(message, True, theme["warning"], theme["value"])
+        if lower.startswith("tmux session available:"):
+            return style_key_value(
+                message,
+                True,
+                theme["success"] if lower.endswith("yes") else theme["warning"],
+                theme["value"],
+            )
+        if (
+            lower.startswith("use './paperscript.sh")
+            or lower.startswith("exact manual command:")
+            or lower.startswith("release page:")
+            or lower.startswith("for a stable overview")
+            or lower.startswith("for an experimental overview")
+        ):
+            return color_text(message, theme["hint"], True, bold=True)
+        if (
+            lower.startswith("dry run:")
+            or "no newer stable build" in lower
+            or "no download was performed" in lower
+            or "cancelled" in lower
+            or "force" in lower
+            or "latest stable is" in lower
+            or "newer version available" in lower
+            or "would ask" in lower
+        ):
+            return color_text(message, theme["warning"], True, bold=True)
         if ": " in message:
-            return style_key_value(message, True, ANSI_CYAN)
+            return style_key_value(message, True, theme["key"], theme["value"])
         return message
 
     def log(self, message: str) -> None:
@@ -338,7 +430,7 @@ class Logger:
             raise PaperScriptError(
                 "A prompt was required, but no interactive terminal is available. Re-run with --yes or adjust config."
             )
-        return input(color_text(message, ANSI_MAGENTA, self.use_color, bold=True))
+        return input(color_text(message, self.theme["prompt"], self.use_color, bold=True))
 
 
 class PaperAPI:
@@ -475,6 +567,18 @@ def guess_version_group(version: str) -> str:
     return version
 
 
+def normalize_choice(value: Any, allowed: set[str], default: str) -> str:
+    normalized = str(value or "").strip().lower()
+    if normalized in allowed:
+        return normalized
+    return default
+
+
+def resolve_color_theme(name: Any) -> dict[str, str]:
+    normalized = normalize_choice(name, set(COLOR_THEMES), "default")
+    return COLOR_THEMES[normalized]
+
+
 class PaperScriptApp:
     def __init__(self, args: argparse.Namespace) -> None:
         self.args = args
@@ -483,14 +587,19 @@ class PaperScriptApp:
         self.server_dir = self._resolve_server_dir()
         self.config_path = self.runtime_dir / "config.json"
         self.state_path = self.runtime_dir / "state.json"
+        self.todo_path = self.runtime_dir / "todo.log"
         self.config = self._load_config()
+        self.quiet_mode = bool(args.quiet or self.config.get("quiet"))
+        self.no_color = bool(args.no_color or self.config.get("no_color"))
+        self.color_theme_name = normalize_choice(self.config.get("color_theme"), set(COLOR_THEMES), "default")
         self.backups_dir = self.runtime_dir / str(self.config["backup_dir"])
         self.downloads_dir = self.runtime_dir / str(self.config["downloads_dir"])
         self.log_path = self.runtime_dir / str(self.config["log_file"])
         self.logger = Logger(
             self.log_path,
-            quiet=bool(args.quiet),
-            use_color=supports_color(sys.stdout, no_color=bool(args.no_color)),
+            quiet=self.quiet_mode,
+            use_color=supports_color(sys.stdout, no_color=self.no_color),
+            theme_name=self.color_theme_name,
         )
         ensure_directory(self.backups_dir)
         ensure_directory(self.downloads_dir)
@@ -510,6 +619,9 @@ class PaperScriptApp:
         self.confirm_before_downgrade = bool(self.config["confirm_before_downgrade"])
         self.auto_detect_server_by_port = bool(self.config["auto_detect_server_by_port"])
         self.fallback_process_detection = bool(self.config["fallback_process_detection"])
+        self.default_status_view = normalize_choice(self.config.get("default_status_view"), {"full", "compact"}, "full")
+        self.command_hint_mode = normalize_choice(self.config.get("command_hint_mode"), {"auto", "always", "never"}, "auto")
+        self.release_link_mode = normalize_choice(self.config.get("release_link_mode"), {"auto", "always", "never"}, "auto")
         self.http_timeout = int(args.timeout) if args.timeout is not None else int(self.config["http_timeout_seconds"])
         self.user_agent = self._resolve_user_agent()
         self.api = PaperAPI(self.user_agent, timeout=self.http_timeout)
@@ -524,6 +636,38 @@ class PaperScriptApp:
         if current is None:
             return None
         return f"./paperscript.sh --force download --version {current.version} --build {current.build}"
+
+    def tmux_session_available(self) -> bool:
+        return run_command(["tmux", "has-session", "-t", self.tmux_session]).returncode == 0
+
+    def effective_status_view(self) -> str:
+        if getattr(self.args, "status_full", False):
+            return "full"
+        if getattr(self.args, "status_compact", False):
+            return "compact"
+        return self.default_status_view
+
+    def should_show_command_hints(self, important: bool = False) -> bool:
+        if self.command_hint_mode == "always":
+            return True
+        if self.command_hint_mode == "never":
+            return False
+        return important or not self.logger.quiet
+
+    def should_show_release_link(self, relevant: bool = False) -> bool:
+        if self.release_link_mode == "always":
+            return True
+        if self.release_link_mode == "never":
+            return False
+        return relevant
+
+    def log_command_hint(self, message: str, important: bool = False) -> None:
+        if self.should_show_command_hints(important):
+            self.logger.log(message)
+
+    def log_release_page(self, relevant: bool = False) -> None:
+        if self.should_show_release_link(relevant):
+            self.logger.log(f"Release page: {PAPER_DOWNLOADS_URL}")
 
     def _resolve_server_dir(self) -> Path:
         if self.args.server_dir:
@@ -644,6 +788,9 @@ class PaperScriptApp:
             )
         else:
             self.logger.log("Detected current jar: none")
+        self.log_command_hint(
+            "For a stable overview, run './paperscript.sh stable'. For an experimental overview, run './paperscript.sh experimental'."
+        )
 
     def list_versions(self, show_channels: bool = False) -> None:
         versions = self.api.get_project_versions()
@@ -1177,33 +1324,40 @@ class PaperScriptApp:
         self.install_build(selected, force_version_prompt=True, prompt_for_force_reinstall=True)
 
     def run_status(self) -> None:
+        compact = self.effective_status_view() == "compact"
         properties = parse_properties(self.server_dir / "server.properties")
         current = self.find_current_jar()
         running = self.detect_running_server_processes()
         latest_version, latest_build = self.latest_stable_version()
         latest_experimental_version, latest_experimental_build = self.latest_version_for_channel("ALPHA")
+        tmux_available = self.tmux_session_available()
+        update_relevant = current is None
 
         self.logger.kv("PaperScript version", APP_RELEASE)
         self.logger.kv("Server directory", str(self.server_dir))
-        self.logger.kv("Runtime directory", str(self.runtime_dir))
-        self.logger.kv("Server label", str(self.server_name or "none"))
-        self.logger.kv("tmux session", self.tmux_session)
-        self.logger.kv("Server properties found", format_bool((self.server_dir / "server.properties").exists()))
-        self.logger.kv("Configured server port", properties.get("server-port", "25565"))
-        self.logger.kv("Running server detected", format_bool(bool(running)))
-        if running:
-            for pid, command in running:
-                self.logger.kv(f"  PID {pid}", command)
+        if not compact:
+            self.logger.kv("Runtime directory", str(self.runtime_dir))
+            self.logger.kv("Server label", str(self.server_name or "none"))
+            self.logger.kv("tmux session", self.tmux_session)
+            self.logger.kv("tmux session available", format_bool(tmux_available))
+            self.logger.kv("Graceful stop command", self.graceful_stop_command)
+            self.logger.kv("Server properties found", format_bool((self.server_dir / "server.properties").exists()))
+            self.logger.kv("Configured server port", properties.get("server-port", "25565"))
+            self.logger.kv("Running server detected", format_bool(bool(running)))
+            if running:
+                for pid, command in running:
+                    self.logger.kv(f"  PID {pid}", command)
         if current:
             self.logger.kv(
                 "Current jar",
                 f"{current.path.name} (version {current.version}, build #{current.build})",
             )
             current_sha = sha256_file(current.path)
-            self.logger.kv("Current jar SHA-256", current_sha)
+            if not compact:
+                self.logger.kv("Current jar SHA-256", current_sha)
             expected_sha = self.state.get("expected_sha256")
             state_jar = self.state.get("current_jar")
-            if expected_sha and state_jar == current.path.name:
+            if expected_sha and state_jar == current.path.name and not compact:
                 self.logger.kv("Expected SHA-256", str(expected_sha))
                 self.logger.kv(
                     "Current SHA matches expected",
@@ -1216,15 +1370,12 @@ class PaperScriptApp:
             f"Latest {self.check_latest_channel_only.lower()} release",
             f"{latest_version} build #{latest_build.build_id}",
         )
-        self.logger.log(
-            "Use './paperscript.sh update' to install the latest stable release, "
-            "or './paperscript.sh --force update' to re-download it even if it is already installed."
-        )
         if current is None:
             self.logger.kv(
                 "Update status",
                 "no installed jar detected, so PaperScript would offer the latest release.",
             )
+            update_relevant = True
         else:
             version_cmp = compare_versions(current.version, latest_version)
             if version_cmp == 0:
@@ -1233,6 +1384,7 @@ class PaperScriptApp:
                         "Update status",
                         f"newer build available for the same version ({current.build} -> {latest_build.build_id}).",
                     )
+                    update_relevant = True
                 elif latest_build.build_id == current.build:
                     self.logger.kv("Update status", "already on the latest stable build.")
                 else:
@@ -1245,13 +1397,20 @@ class PaperScriptApp:
                     "Update status",
                     f"newer version available ({current.version} -> {latest_version}).",
                 )
+                update_relevant = True
             else:
                 self.logger.kv(
                     "Update status",
                     "installed version is newer than the latest stable version this script found.",
                 )
 
-        if self.status_show_all_channels:
+        self.log_command_hint(
+            "Use './paperscript.sh stable' to inspect the latest stable release, './paperscript.sh update' to install it, "
+            "or './paperscript.sh --force update' to re-download it even if it is already installed."
+        )
+        self.log_release_page(update_relevant)
+
+        if self.status_show_all_channels and not compact:
             self.logger.log(f"Latest channels for stable version {latest_version}:")
             channels = self.latest_builds_by_channel(latest_version)
             for channel in ["STABLE", "BETA", "ALPHA", "RECOMMENDED"]:
@@ -1266,13 +1425,26 @@ class PaperScriptApp:
             "Latest experimental release",
             f"{latest_experimental_version} build #{latest_experimental_build.build_id}",
         )
-        self.logger.log(
+        self.log_command_hint(
             "Use './paperscript.sh experimental' to inspect it, or './paperscript.sh experimental --download' to install it."
         )
         self.logger.kv(
             "Backup retention",
             f"keep {self.keep_backups} backups, cleanup after install {format_bool(self.cleanup_backups_after_install)}",
         )
+
+    def run_stable(self, download: bool = False) -> None:
+        version, build = self.latest_stable_version()
+        self.logger.log(f"Latest stable release overall: {version} build #{build.build_id} ({format_bytes(build.size)})")
+        self.logger.log(f"Download URL: {build.download_url}")
+        if build.sha256:
+            self.logger.log(f"Expected SHA-256: {build.sha256}")
+        self.log_command_hint(
+            f"Exact manual command: ./paperscript.sh download --version {version} --channel {self.check_latest_channel_only}"
+        )
+        self.log_release_page(relevant=True)
+        if download:
+            self.install_build(build, force_version_prompt=False, prompt_for_force_reinstall=True)
 
     def run_experimental(self, download: bool = False) -> None:
         version, build = self.latest_version_for_channel("ALPHA")
@@ -1282,9 +1454,10 @@ class PaperScriptApp:
         self.logger.log(f"Download URL: {build.download_url}")
         if build.sha256:
             self.logger.log(f"Expected SHA-256: {build.sha256}")
-        self.logger.log(f"Exact manual command: ./paperscript.sh download --version {version} --channel ALPHA")
+        self.log_command_hint(f"Exact manual command: ./paperscript.sh download --version {version} --channel ALPHA", important=True)
+        self.log_release_page(relevant=True)
         if download:
-            self.install_build(build, force_version_prompt=True)
+            self.install_build(build, force_version_prompt=True, prompt_for_force_reinstall=True)
 
     def run_verify(self) -> None:
         current = self.find_current_jar()
@@ -1346,6 +1519,8 @@ class PaperScriptApp:
             "logs": bool(getattr(self.args, "cleanup_logs", False)),
             "json": bool(getattr(self.args, "cleanup_json", False)),
         }
+        if getattr(self.args, "cleanup_keep", None) is not None:
+            selected["backups"] = True
         if not any(selected.values()):
             selected["downloads"] = True
             selected["pycache"] = True
@@ -1356,7 +1531,11 @@ class PaperScriptApp:
         if selection["downloads"]:
             descriptions.append(f"Delete staged downloads and temp files in {self.downloads_dir}")
         if selection["backups"]:
-            descriptions.append(f"Delete all backup jars in {self.backups_dir}")
+            keep = getattr(self.args, "cleanup_keep", None)
+            if keep is None:
+                descriptions.append(f"Delete all backup jars in {self.backups_dir}")
+            else:
+                descriptions.append(f"Trim backup jars in {self.backups_dir} so only the newest {keep} remain")
         if selection["pycache"]:
             descriptions.append(f"Delete Python __pycache__ folders under {self.runtime_dir}")
         if selection["logs"]:
@@ -1382,9 +1561,63 @@ class PaperScriptApp:
     def find_pycache_dirs(self) -> list[Path]:
         return [path for path in self.runtime_dir.rglob("__pycache__") if path.is_dir()]
 
+    def trim_backups_to_keep(self, keep: int) -> int:
+        if keep < 0:
+            raise PaperScriptError("Cleanup backup retention cannot be negative.")
+        backups = [path for path in self.backups_dir.iterdir() if path.is_file()]
+        backups.sort(key=lambda item: item.stat().st_mtime, reverse=True)
+        removed = 0
+        for old_path in backups[keep:]:
+            old_path.unlink()
+            removed += 1
+        return removed
+
     def console_only(self, message: str) -> None:
         if not self.logger.quiet:
             print(message)
+
+    def run_init(self) -> None:
+        actions: list[str] = []
+        if not self.backups_dir.exists():
+            actions.append(f"Create backup directory {self.backups_dir}")
+        if not self.downloads_dir.exists():
+            actions.append(f"Create downloads directory {self.downloads_dir}")
+        if not self.config_path.exists():
+            actions.append(f"Create default config file {self.config_path}")
+        if not self.state_path.exists():
+            actions.append(f"Create empty state file {self.state_path}")
+        if not self.log_path.exists():
+            actions.append(f"Create log file {self.log_path}")
+        if not self.todo_path.exists():
+            actions.append(f"Create todo log {self.todo_path}")
+
+        if not actions:
+            self.logger.log("PaperScript runtime is already initialized.")
+            return
+
+        self.logger.log("PaperScript init will do the following:")
+        for action in actions:
+            self.logger.log(f"  - {action}")
+
+        if self.args.dry_run:
+            self.logger.log("Dry run: no files were created.")
+            return
+
+        if not self.args.yes and not prompt_yes_no("Proceed with init?", default=False, logger=self.logger):
+            self.logger.log("Cancelled init.")
+            return
+
+        ensure_directory(self.backups_dir)
+        ensure_directory(self.downloads_dir)
+        if not self.config_path.exists():
+            self._save_json(self.config_path, self.config)
+        if not self.state_path.exists():
+            self._save_json(self.state_path, {})
+        if not self.log_path.exists():
+            self.log_path.write_text("", encoding="utf-8")
+        if not self.todo_path.exists():
+            self.todo_path.write_text(TODO_TEMPLATE, encoding="utf-8")
+        self.logger.log("Init finished.")
 
     def run_cleanup(self) -> None:
         selection = self.cleanup_selection()
@@ -1414,8 +1647,14 @@ class PaperScriptApp:
             self.logger.log(f"Removed {removed_downloads} item(s) from {self.downloads_dir}")
 
         if selection["backups"]:
-            removed_backups = self.remove_directory_contents(self.backups_dir)
-            self.logger.log(f"Removed {removed_backups} item(s) from {self.backups_dir}")
+            if getattr(self.args, "cleanup_keep", None) is None:
+                removed_backups = self.remove_directory_contents(self.backups_dir)
+                self.logger.log(f"Removed {removed_backups} item(s) from {self.backups_dir}")
+            else:
+                removed_backups = self.trim_backups_to_keep(int(self.args.cleanup_keep))
+                self.logger.log(
+                    f"Removed {removed_backups} old backup item(s) from {self.backups_dir} and kept the newest {self.args.cleanup_keep}"
+                )
 
         if selection["pycache"]:
             for pycache_dir in self.find_pycache_dirs():
@@ -1514,8 +1753,29 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Show what PaperScript would do without changing files or stopping servers.",
     )
-    subparsers.add_parser("status", help="Show current server state and whether an update is available.")
+    status_parser = subparsers.add_parser("status", help="Show current server state and whether an update is available.")
+    status_parser.add_argument(
+        "--compact",
+        dest="status_compact",
+        action="store_true",
+        help="Show a shorter status view.",
+    )
+    status_parser.add_argument(
+        "--full",
+        dest="status_full",
+        action="store_true",
+        help="Force the full status view even if config defaults to compact.",
+    )
     subparsers.add_parser("verify", help="Verify the current jar SHA-256 against recorded state and the live API when available.")
+    stable_parser = subparsers.add_parser(
+        "stable",
+        help="Show or download the latest stable Paper release overall.",
+    )
+    stable_parser.add_argument(
+        "--download",
+        action="store_true",
+        help="Download and install the latest stable release overall.",
+    )
     experimental_parser = subparsers.add_parser(
         "experimental",
         help="Show or download the latest experimental Paper release overall.",
@@ -1539,7 +1799,14 @@ def build_parser() -> argparse.ArgumentParser:
         "--backups",
         dest="cleanup_backups",
         action="store_true",
-        help="Delete all files in backups/.",
+        help="Delete all files in backups/, or trim them when used with --keep.",
+    )
+    cleanup_parser.add_argument(
+        "--keep",
+        dest="cleanup_keep",
+        type=int,
+        default=None,
+        help="When cleaning backups, keep the newest N backup files instead of deleting them all.",
     )
     cleanup_parser.add_argument(
         "--pycache",
@@ -1582,6 +1849,7 @@ def build_parser() -> argparse.ArgumentParser:
     inspect_parser.add_argument("version", help="Minecraft version to inspect, for example 1.20.4 or 26.1.2")
 
     subparsers.add_parser("explore", help="Interactively pick a version, inspect it, and optionally download it.")
+    subparsers.add_parser("init", help="Create or repair the PaperScript runtime files in paperscript/ with confirmation.")
 
     download_parser = subparsers.add_parser("download", help="Download a chosen version or exact build.")
     download_parser.add_argument("--version", required=True, help="Minecraft version to download.")
@@ -1616,6 +1884,8 @@ def main() -> int:
             app.run_status()
         elif args.command == "verify":
             app.run_verify()
+        elif args.command == "stable":
+            app.run_stable(download=args.download)
         elif args.command == "experimental":
             app.run_experimental(download=args.download)
         elif args.command == "cleanup":
@@ -1626,6 +1896,8 @@ def main() -> int:
             app.inspect_version(args.version, offer_download=True)
         elif args.command == "explore":
             app.explore_versions()
+        elif args.command == "init":
+            app.run_init()
         elif args.command == "download":
             selected_channel = args.channel.upper() if args.channel else app.default_channel
             app.run_download(args.version, args.build, selected_channel)
@@ -1638,7 +1910,12 @@ def main() -> int:
         return 130
     except PaperScriptError as error:
         print(
-            color_text(f"Error: {error}", ANSI_RED, supports_color(sys.stderr, no_color=bool(args.no_color)), bold=True),
+            color_text(
+                f"Error: {error}",
+                ANSI_RED,
+                supports_color(sys.stderr, no_color=bool(getattr(args, "no_color", False))),
+                bold=True,
+            ),
             file=sys.stderr,
         )
         return 1

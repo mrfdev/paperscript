@@ -1,0 +1,6 @@
+PaperScript todo
+
+- Future automation: optional update scheduling or smarter unattended workflows.
+- Future cleanup polish: extra selective cleanup and repair helpers beyond the current safe set.
+- Future tmux/server control: start, stop, restart, and richer session management helpers.
+- Future validation mode: additional smoke-test or planner mode beyond today's dry-run behavior.
