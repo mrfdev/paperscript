@@ -687,7 +687,11 @@ class PaperScriptApp:
                     default="stable" if "STABLE" in by_channel else None,
                     logger=self.logger,
                 )
-                self.install_build(by_channel[selected.upper()], force_version_prompt=True)
+                self.install_build(
+                    by_channel[selected.upper()],
+                    force_version_prompt=True,
+                    prompt_for_force_reinstall=True,
+                )
 
     def explore_versions(self) -> None:
         versions = [item["id"] for item in self.api.get_project_versions()]
@@ -1012,21 +1016,45 @@ class PaperScriptApp:
         if self.cleanup_backups_after_install:
             self.logger.log(f"Dry run: would keep the newest {self.keep_backups} backups after install.")
 
-    def install_build(self, build: BuildInfo, force_version_prompt: bool = False) -> None:
+    def install_build(
+        self,
+        build: BuildInfo,
+        force_version_prompt: bool = False,
+        prompt_for_force_reinstall: bool = False,
+    ) -> None:
         current = self.find_current_jar()
         target_name = self.format_download_filename(build)
+        manual_force_reinstall = False
         if current and current.version == build.version and current.build >= build.build_id and not self.args.force:
-            self.logger.log(
-                f"Current jar {current.path.name} is already build #{current.build} for version {current.version}. "
-                "Nothing newer needs to be downloaded."
-            )
-            return
+            if (
+                current.build == build.build_id
+                and prompt_for_force_reinstall
+                and not self.args.dry_run
+                and sys.stdin.isatty()
+            ):
+                if prompt_yes_no(
+                    f"Current jar {current.path.name} is already build #{current.build}. Download it anyway?",
+                    default=False,
+                    logger=self.logger,
+                ):
+                    self.logger.log("Proceeding with a forced re-download of the same build.")
+                    manual_force_reinstall = True
+                else:
+                    self.logger.log("Cancelled re-download of the same build.")
+                    return
+            if not manual_force_reinstall:
+                self.logger.log(
+                    f"Current jar {current.path.name} is already build #{current.build} for version {current.version}. "
+                    "Nothing newer needs to be downloaded."
+                )
+                return
 
         if current and current.version == build.version and current.build < build.build_id and not self.allow_same_version_build_upgrade:
             self.logger.log("Same-version build upgrades are disabled in config, so the newer build will not be installed.")
             return
 
-        if current and self.args.force and self.confirm_before_force_download and not self.args.yes and not self.args.dry_run:
+        force_requested = self.args.force or manual_force_reinstall
+        if current and force_requested and self.confirm_before_force_download and not self.args.yes and not self.args.dry_run and not manual_force_reinstall:
             if not prompt_yes_no(
                 "Force download is enabled. Continue with the requested install?",
                 default=False,
@@ -1034,7 +1062,7 @@ class PaperScriptApp:
             ):
                 self.logger.log("Cancelled forced download.")
                 return
-        elif current and self.args.force and self.confirm_before_force_download and self.args.dry_run:
+        elif current and force_requested and self.confirm_before_force_download and self.args.dry_run:
             self.logger.log("Dry run: PaperScript would ask for confirmation before a forced download.")
 
         if current and compare_versions(current.version, build.version) > 0 and self.confirm_before_downgrade and not self.args.yes and not self.args.dry_run:
@@ -1117,13 +1145,13 @@ class PaperScriptApp:
             selected = next((build for build in builds if build.build_id == build_id), None)
             if not selected:
                 raise PaperScriptError(f"Build #{build_id} was not found for version {version}")
-            self.install_build(selected, force_version_prompt=True)
+            self.install_build(selected, force_version_prompt=True, prompt_for_force_reinstall=True)
             return
 
         selected = self.api.get_latest_build(version, channel=channel)
         if not selected:
             raise PaperScriptError(f"No {channel.upper()} build was found for version {version}")
-        self.install_build(selected, force_version_prompt=True)
+        self.install_build(selected, force_version_prompt=True, prompt_for_force_reinstall=True)
 
     def run_status(self) -> None:
         properties = parse_properties(self.server_dir / "server.properties")
@@ -1265,6 +1293,115 @@ class PaperScriptApp:
         else:
             self.logger.log("API checksum verification: this build did not include a SHA-256 in the API response.")
 
+    def cleanup_selection(self) -> dict[str, bool]:
+        selected = {
+            "downloads": bool(getattr(self.args, "cleanup_downloads", False)),
+            "backups": bool(getattr(self.args, "cleanup_backups", False)),
+            "pycache": bool(getattr(self.args, "cleanup_pycache", False)),
+            "logs": bool(getattr(self.args, "cleanup_logs", False)),
+            "json": bool(getattr(self.args, "cleanup_json", False)),
+        }
+        if not any(selected.values()):
+            selected["downloads"] = True
+            selected["pycache"] = True
+        return selected
+
+    def cleanup_descriptions(self, selection: dict[str, bool]) -> list[str]:
+        descriptions: list[str] = []
+        if selection["downloads"]:
+            descriptions.append(f"Delete staged downloads and temp files in {self.downloads_dir}")
+        if selection["backups"]:
+            descriptions.append(f"Delete all backup jars in {self.backups_dir}")
+        if selection["pycache"]:
+            descriptions.append(f"Delete Python __pycache__ folders under {self.runtime_dir}")
+        if selection["logs"]:
+            descriptions.append(f"Clear the log file at {self.log_path}")
+        if selection["json"]:
+            descriptions.append(
+                f"Delete {self.config_path.name} and {self.state_path.name} so the next run starts fresh"
+            )
+        return descriptions
+
+    def remove_directory_contents(self, path: Path) -> int:
+        if not path.exists():
+            return 0
+        removed = 0
+        for child in path.iterdir():
+            if child.is_dir():
+                shutil.rmtree(child)
+            else:
+                child.unlink()
+            removed += 1
+        return removed
+
+    def find_pycache_dirs(self) -> list[Path]:
+        return [path for path in self.runtime_dir.rglob("__pycache__") if path.is_dir()]
+
+    def console_only(self, message: str) -> None:
+        if not self.logger.quiet:
+            print(message)
+
+    def run_cleanup(self) -> None:
+        selection = self.cleanup_selection()
+        descriptions = self.cleanup_descriptions(selection)
+
+        self.logger.log("Cleanup targets selected:")
+        for description in descriptions:
+            self.logger.log(f"  - {description}")
+
+        if self.args.dry_run:
+            self.logger.log("Dry run: no files were deleted.")
+            return
+
+        if not self.args.yes:
+            if not prompt_yes_no("Proceed with cleanup?", default=False, logger=self.logger):
+                self.logger.log("Cancelled cleanup.")
+                return
+
+        removed_downloads = 0
+        removed_backups = 0
+        removed_pycache = 0
+        cleared_logs = False
+        removed_json = 0
+
+        if selection["downloads"]:
+            removed_downloads = self.remove_directory_contents(self.downloads_dir)
+            self.logger.log(f"Removed {removed_downloads} item(s) from {self.downloads_dir}")
+
+        if selection["backups"]:
+            removed_backups = self.remove_directory_contents(self.backups_dir)
+            self.logger.log(f"Removed {removed_backups} item(s) from {self.backups_dir}")
+
+        if selection["pycache"]:
+            for pycache_dir in self.find_pycache_dirs():
+                shutil.rmtree(pycache_dir)
+                removed_pycache += 1
+            self.logger.log(f"Removed {removed_pycache} __pycache__ folder(s)")
+
+        if selection["json"]:
+            for json_path in [self.config_path, self.state_path]:
+                if json_path.exists():
+                    json_path.unlink()
+                    removed_json += 1
+            self.logger.log(f"Removed {removed_json} JSON file(s)")
+
+        if selection["logs"]:
+            self.log_path.write_text("", encoding="utf-8")
+            cleared_logs = True
+
+        summary = (
+            "Cleanup finished: "
+            f"downloads={removed_downloads}, "
+            f"backups={removed_backups}, "
+            f"pycache={removed_pycache}, "
+            f"json={removed_json}, "
+            f"logs={'cleared' if cleared_logs else 'unchanged'}"
+        )
+        if cleared_logs:
+            self.console_only(summary)
+        else:
+            self.logger.log(summary)
+
 
 def timestamp_for_filename() -> str:
     return datetime.now().strftime("%Y%m%d-%H%M%S")
@@ -1343,6 +1480,51 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Download and install the latest experimental release overall.",
     )
+    cleanup_parser = subparsers.add_parser(
+        "cleanup",
+        help="Remove selected runtime files such as downloads, backups, __pycache__, logs, or JSON state/config.",
+    )
+    cleanup_parser.add_argument(
+        "--downloads",
+        dest="cleanup_downloads",
+        action="store_true",
+        help="Delete staged downloads and temporary files in downloads/.",
+    )
+    cleanup_parser.add_argument(
+        "--backups",
+        dest="cleanup_backups",
+        action="store_true",
+        help="Delete all files in backups/.",
+    )
+    cleanup_parser.add_argument(
+        "--pycache",
+        dest="cleanup_pycache",
+        action="store_true",
+        help="Delete Python __pycache__ folders under the PaperScript runtime directory.",
+    )
+    cleanup_parser.add_argument(
+        "--logs",
+        dest="cleanup_logs",
+        action="store_true",
+        help="Clear logs.log.",
+    )
+    cleanup_parser.add_argument(
+        "--json",
+        "--config",
+        dest="cleanup_json",
+        action="store_true",
+        help="Delete config.json and state.json so the next run starts fresh.",
+    )
+    cleanup_parser.add_argument(
+        "--yes",
+        action="store_true",
+        help="Skip the cleanup confirmation prompt.",
+    )
+    cleanup_parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Show what cleanup would delete without removing anything.",
+    )
 
     list_parser = subparsers.add_parser("list-versions", help="List versions available from the API.")
     list_parser.add_argument(
@@ -1391,6 +1573,8 @@ def main() -> int:
             app.run_verify()
         elif args.command == "experimental":
             app.run_experimental(download=args.download)
+        elif args.command == "cleanup":
+            app.run_cleanup()
         elif args.command == "list-versions":
             app.list_versions(show_channels=args.channels)
         elif args.command == "inspect":

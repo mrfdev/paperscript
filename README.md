@@ -40,6 +40,7 @@ Bash is still useful here as a tiny wrapper, but Python is much more maintainabl
 - Adds a `status` command to show the current state and whether an update is available.
 - Adds a `verify` command to hash the current jar and compare it with recorded and API-reported SHA-256 values.
 - Adds an `experimental` command to show or download the latest experimental Paper release overall.
+- Adds a `cleanup` command for downloads, backups, `__pycache__`, logs, and local JSON state/config resets.
 - Adds a `--dry-run` mode so you can preview actions without changing files.
 - Verifies the downloaded jar against the API-provided SHA-256 checksum before install.
 - Backs up the current Paper jar before installing a new one.
@@ -169,6 +170,48 @@ Examples:
 
 If you want the exact manual install command after seeing the latest experimental version, PaperScript prints it for you.
 
+### `cleanup`
+
+Removes selected local runtime files and caches.
+
+Default behavior:
+
+- `./paperscript cleanup`
+  Cleans the safe/default targets: `downloads/` and Python `__pycache__/`
+
+Selectable targets:
+
+- `--downloads`
+  Delete staged downloads and temporary files in `downloads/`
+- `--backups`
+  Delete all files in `backups/`
+- `--pycache`
+  Delete Python `__pycache__/` folders
+- `--logs`
+  Clear `logs.log`
+- `--json` or `--config`
+  Delete `config.json` and `state.json` so the next run starts fresh
+
+Confirmation behavior:
+
+- cleanup shows a short explanation of what will be deleted
+- cleanup asks for `y/N` confirmation by default
+- `--yes` skips the confirmation prompt
+- `--dry-run` shows what would be deleted without removing anything
+
+Examples:
+
+```bash
+./paperscript cleanup
+./paperscript cleanup --downloads
+./paperscript cleanup --backups
+./paperscript cleanup --pycache
+./paperscript cleanup --logs
+./paperscript cleanup --json
+./paperscript cleanup --yes --downloads --pycache
+./paperscript cleanup --dry-run --json
+```
+
 ### `list-versions`
 
 Lists all Paper versions the API currently exposes.
@@ -193,6 +236,8 @@ This is the command to use when you want visibility like:
 
 Shows the newest available build per channel for one specific Minecraft version, then offers to download one interactively.
 
+If the selected build is already installed, PaperScript can now offer a direct `Download it anyway?` confirmation so you can re-download the same build without leaving the inspect flow.
+
 Examples:
 
 ```bash
@@ -204,6 +249,8 @@ Examples:
 ### `explore`
 
 Interactive version picker. It lists all available versions, lets you choose one by number, shows the newest builds for that version, and can then download it.
+
+If the build you choose is already installed, `explore` uses the same direct `Download it anyway?` confirmation flow as `inspect`.
 
 Examples:
 
