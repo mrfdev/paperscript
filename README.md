@@ -14,6 +14,7 @@ It is designed for the layout where your server root stays readable, while Paper
 /anydirectory/paperscript/config.example.json
 /anydirectory/paperscript/config.json
 /anydirectory/paperscript/state.json
+/anydirectory/paperscript/cache/
 /anydirectory/paperscript/downloads/
 /anydirectory/paperscript/backups/
 /anydirectory/paperscript/logs.log
@@ -46,6 +47,7 @@ Bash still has a place here, which is why the launcher remains a simple `papersc
 - Supports forced re-download of the same build with `--force`.
 - Verifies downloads against the API-provided SHA-256.
 - Stores the installed SHA-256 in `state.json` for later `verify` checks.
+- Caches Paper API metadata locally so repeated release checks are faster.
 - Backs up the current jar before replacing it.
 - Keeps only the newest 10 backups by default.
 - Can trim backups to a chosen count with `cleanup --backups --keep N`.
@@ -238,9 +240,18 @@ Examples:
 ```bash
 ./paperscript.sh list-versions
 ./paperscript.sh list-versions --channels
+./paperscript.sh list-versions --channels --limit 10
+./paperscript.sh --debug-http list-versions --channels --limit 10
 ```
 
 With `--channels`, PaperScript also shows the newest build it can find per channel for each version.
+
+Because `--channels` performs many API requests, PaperScript now:
+
+- retries transient API and Cloudflare errors
+- continues past temporary per-version failures by default
+- supports `--limit` for smaller debug runs
+- supports `--channel-delay-ms` to slow the request rate when needed
 
 This is useful for questions like:
 
@@ -319,7 +330,9 @@ Targets:
 - `--backups --keep N`
   Keep the newest `N` backups and remove older ones
 - `--all`
-  Clean downloads, backups, `__pycache__`, logs, and JSON state/config together
+  Clean downloads, backups, metadata cache, `__pycache__`, logs, and JSON state/config together
+- `--metadata-cache`
+  Delete cached Paper API metadata in `cache/`
 - `--pycache`
   Delete Python `__pycache__/` folders
 - `--logs`
@@ -341,6 +354,7 @@ Examples:
 ./paperscript.sh cleanup --all
 ./paperscript.sh cleanup --downloads
 ./paperscript.sh cleanup --backups
+./paperscript.sh cleanup --metadata-cache
 ./paperscript.sh cleanup --backups --keep 10
 ./paperscript.sh cleanup --pycache
 ./paperscript.sh cleanup --logs
@@ -384,6 +398,10 @@ Examples:
   tmux session to use for graceful stop. Defaults to config, `PAPERSCRIPT_TMUX_SESSION`, or `mcserver`.
 - `--timeout SECONDS`
   HTTP timeout in seconds. Default comes from `config.json` and is `30` unless changed.
+- `--debug-http`
+  Log HTTP request attempts and retries for Paper API troubleshooting.
+- `--no-metadata-cache`
+  Bypass the local Paper API metadata cache for this run.
 - `--yes`
   Accept prompts automatically where it is safe to do so.
 - `--force`
@@ -409,6 +427,14 @@ For cron or scheduled tasks, the safest pattern is usually:
 ```
 
 That keeps the run non-interactive, quiet on stdout, and still logged to `paperscript/logs.log`.
+
+For API troubleshooting, a good pattern is:
+
+```bash
+./paperscript.sh --debug-http --timeout 5 stable
+./paperscript.sh --debug-http list-versions --channels --limit 10
+./paperscript.sh --no-metadata-cache --debug-http stable
+```
 
 ## How Server Directory Detection Works
 
@@ -480,6 +506,8 @@ PaperScript stores its runtime files inside the visible `paperscript/` directory
   Activity log
 - `paperscript/downloads/`
   Temporary and staged downloads
+- `paperscript/cache/`
+  Cached Paper API metadata used to speed up repeated checks
 - `paperscript/backups/`
   Previous jars moved out of the server root
 - `paperscript/todo.log`
@@ -513,6 +541,9 @@ Current default config:
   "log_file": "logs.log",
   "backup_dir": "backups",
   "downloads_dir": "downloads",
+  "metadata_cache_dir": "cache",
+  "metadata_cache_enabled": true,
+  "metadata_cache_ttl_seconds": 300,
   "confirm_before_force_download": true,
   "confirm_before_downgrade": true,
   "auto_detect_server_by_port": true,
@@ -522,7 +553,12 @@ Current default config:
   "color_theme": "default",
   "default_status_view": "full",
   "command_hint_mode": "auto",
-  "release_link_mode": "auto"
+  "release_link_mode": "auto",
+  "debug_http": false,
+  "http_retries": 2,
+  "http_retry_backoff_seconds": 1.5,
+  "list_versions_channel_delay_ms": 150,
+  "list_versions_continue_on_error": true
 }
 ```
 
@@ -538,6 +574,10 @@ Useful per-server settings:
   Default behavior when a running server is detected
 - `default_channel`
   Default download channel for `download --version`
+- `metadata_cache_enabled`
+  Enable or disable the local Paper API metadata cache
+- `metadata_cache_ttl_seconds`
+  How long cached metadata stays valid before PaperScript refreshes it
 - `quiet`
   Make unattended runs silent by default
 - `no_color`
@@ -550,6 +590,16 @@ Useful per-server settings:
   `auto`, `always`, or `never`
 - `release_link_mode`
   `auto`, `always`, or `never`
+- `debug_http`
+  Log HTTP request attempts and retries
+- `http_retries`
+  Retry count for transient API or Cloudflare errors
+- `http_retry_backoff_seconds`
+  Base retry delay before exponential backoff
+- `list_versions_channel_delay_ms`
+  Delay between per-version channel lookups during `list-versions --channels`
+- `list_versions_continue_on_error`
+  Continue past temporary per-version failures instead of aborting the whole listing
 
 ## Force Re-Downloading A Build
 

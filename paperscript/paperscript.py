@@ -31,6 +31,7 @@ PAPER_DOWNLOADS_URL = "https://papermc.io/downloads/paper"
 DEFAULT_CHANNEL = "STABLE"
 DEFAULT_TIMEOUT = 30
 DEFAULT_USER_AGENT = f"mrfloris-PaperScript/2.0 ({PROJECT_URL})"
+TRANSIENT_HTTP_CODES = {429, 500, 502, 503, 504, 520, 521, 522, 523, 524}
 COMMAND_NAMES = {
     "update",
     "status",
@@ -108,6 +109,9 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "log_file": "logs.log",
     "backup_dir": "backups",
     "downloads_dir": "downloads",
+    "metadata_cache_dir": "cache",
+    "metadata_cache_enabled": True,
+    "metadata_cache_ttl_seconds": 300,
     "confirm_before_force_download": True,
     "confirm_before_downgrade": True,
     "auto_detect_server_by_port": True,
@@ -118,6 +122,11 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "default_status_view": "full",
     "command_hint_mode": "auto",
     "release_link_mode": "auto",
+    "debug_http": False,
+    "http_retries": 2,
+    "http_retry_backoff_seconds": 1.5,
+    "list_versions_channel_delay_ms": 150,
+    "list_versions_continue_on_error": True,
 }
 
 
@@ -163,6 +172,7 @@ class BuildInfo:
 class DownloadVerification:
     sha256: str
     bytes_written: int
+    elapsed_seconds: float
 
 
 def utc_now() -> str:
@@ -337,6 +347,22 @@ def format_bool(value: bool) -> str:
     return "yes" if value else "no"
 
 
+def format_duration(seconds: float) -> str:
+    if seconds < 1:
+        return f"{seconds * 1000:.0f} ms"
+    if seconds < 60:
+        return f"{seconds:.1f} s"
+    minutes = int(seconds // 60)
+    remainder = seconds - (minutes * 60)
+    return f"{minutes}m {remainder:.1f}s"
+
+
+def format_rate(bytes_written: int, seconds: float) -> str:
+    if seconds <= 0:
+        return "instant"
+    return f"{format_bytes(int(bytes_written / seconds))}/s"
+
+
 def sha256_file(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as handle:
@@ -450,20 +476,110 @@ class Logger:
 
 
 class PaperAPI:
-    def __init__(self, user_agent: str, timeout: int = DEFAULT_TIMEOUT) -> None:
+    def __init__(
+        self,
+        user_agent: str,
+        timeout: int = DEFAULT_TIMEOUT,
+        logger: Logger | None = None,
+        debug_http: bool = False,
+        retries: int = 0,
+        retry_backoff_seconds: float = 1.5,
+        cache_dir: Path | None = None,
+        cache_ttl_seconds: int = 300,
+        cache_enabled: bool = True,
+    ) -> None:
         self.user_agent = user_agent
         self.timeout = timeout
+        self.logger = logger
+        self.debug_http = debug_http
+        self.retries = max(0, int(retries))
+        self.retry_backoff_seconds = max(0.0, float(retry_backoff_seconds))
+        self.cache_dir = cache_dir
+        self.cache_ttl_seconds = max(0, int(cache_ttl_seconds))
+        self.cache_enabled = cache_enabled
+
+    def _log_http(self, message: str) -> None:
+        if self.logger is not None and not self.logger.quiet:
+            self.logger.log(message)
+
+    def _cache_path(self, label: str) -> Path | None:
+        if not self.cache_enabled or self.cache_dir is None:
+            return None
+        ensure_directory(self.cache_dir)
+        safe_label = re.sub(r"[^A-Za-z0-9._-]+", "_", label.strip())
+        return self.cache_dir / f"{safe_label}.json"
+
+    def _load_cache(self, label: str) -> Any | None:
+        cache_path = self._cache_path(label)
+        if cache_path is None or not cache_path.exists():
+            return None
+        try:
+            payload = json.loads(cache_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return None
+        if not isinstance(payload, dict):
+            return None
+        cached_at = payload.get("cached_at_epoch")
+        data = payload.get("data")
+        if not isinstance(cached_at, (int, float)):
+            return None
+        age_seconds = max(0.0, time.time() - float(cached_at))
+        if age_seconds > self.cache_ttl_seconds:
+            return None
+        if self.debug_http:
+            self._log_http(f"Using cached metadata ({format_duration(age_seconds)}) for {label}")
+        return data
+
+    def _save_cache(self, label: str, data: Any) -> None:
+        cache_path = self._cache_path(label)
+        if cache_path is None:
+            return
+        payload = {
+            "cached_at": utc_now(),
+            "cached_at_epoch": time.time(),
+            "data": data,
+        }
+        cache_path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
     def _request_json(self, url: str) -> Any:
         request = Request(url, headers={"User-Agent": self.user_agent, "Accept": "application/json"})
-        try:
-            with urlopen(request, timeout=self.timeout) as response:
-                payload = response.read().decode("utf-8")
-        except HTTPError as error:
-            detail = error.read().decode("utf-8", errors="ignore") if hasattr(error, "read") else ""
-            raise PaperScriptError(f"API request failed for {url}: HTTP {error.code} {detail}".strip()) from error
-        except URLError as error:
-            raise PaperScriptError(f"API request failed for {url}: {error.reason}") from error
+        for attempt in range(self.retries + 1):
+            started_at = time.monotonic()
+            if self.debug_http:
+                self._log_http(f"HTTP GET {attempt + 1}/{self.retries + 1}: {url}")
+            try:
+                with urlopen(request, timeout=self.timeout) as response:
+                    payload = response.read().decode("utf-8")
+                if self.debug_http:
+                    self._log_http(
+                        f"HTTP GET completed in {format_duration(time.monotonic() - started_at)}: {url}"
+                    )
+                break
+            except HTTPError as error:
+                detail_raw = error.read().decode("utf-8", errors="ignore") if hasattr(error, "read") else ""
+                if error.code in TRANSIENT_HTTP_CODES and attempt < self.retries:
+                    wait_seconds = self.retry_backoff_seconds * (2 ** attempt)
+                    self._log_http(
+                        f"Transient API error HTTP {error.code} for {url}. Retrying in {wait_seconds:.1f}s..."
+                    )
+                    time.sleep(wait_seconds)
+                    continue
+                detail = summarize_http_detail(detail_raw)
+                message = f"API request failed for {url}: HTTP {error.code}"
+                if detail:
+                    message += f" {detail}"
+                if error.code in TRANSIENT_HTTP_CODES:
+                    message += " The Paper API or Cloudflare may be having a temporary issue; please retry."
+                raise PaperScriptError(message) from error
+            except URLError as error:
+                if attempt < self.retries:
+                    wait_seconds = self.retry_backoff_seconds * (2 ** attempt)
+                    self._log_http(
+                        f"Transient network error for {url}: {error.reason}. Retrying in {wait_seconds:.1f}s..."
+                    )
+                    time.sleep(wait_seconds)
+                    continue
+                raise PaperScriptError(f"API request failed for {url}: {error.reason}") from error
 
         try:
             data = json.loads(payload)
@@ -475,7 +591,10 @@ class PaperAPI:
         return data
 
     def get_project_versions(self) -> list[dict[str, Any]]:
-        rich = self._request_json(f"{API_ROOT}/versions")
+        cached = self._load_cache("versions")
+        rich = cached if cached is not None else self._request_json(f"{API_ROOT}/versions")
+        if cached is None:
+            self._save_cache("versions", rich)
         if isinstance(rich, dict) and isinstance(rich.get("versions"), list):
             versions: list[dict[str, Any]] = []
             for item in rich["versions"]:
@@ -494,7 +613,10 @@ class PaperAPI:
             if versions:
                 return sorted(versions, key=lambda item: parse_version(item["id"]).key(), reverse=True)
 
-        simple = self._request_json(API_ROOT)
+        cached_simple = self._load_cache("project-root")
+        simple = cached_simple if cached_simple is not None else self._request_json(API_ROOT)
+        if cached_simple is None:
+            self._save_cache("project-root", simple)
         raw_versions = simple.get("versions", {})
         flattened: list[dict[str, Any]] = []
         if isinstance(raw_versions, dict):
@@ -505,7 +627,11 @@ class PaperAPI:
 
     def get_builds(self, version: str) -> list[BuildInfo]:
         try:
-            raw = self._request_json(f"{API_ROOT}/versions/{version}/builds")
+            cache_label = f"builds-{version}"
+            cached = self._load_cache(cache_label)
+            raw = cached if cached is not None else self._request_json(f"{API_ROOT}/versions/{version}/builds")
+            if cached is None:
+                self._save_cache(cache_label, raw)
         except PaperScriptError as error:
             detail = str(error).lower()
             if "version_not_found" in detail or "no version was found with the given identifier" in detail:
@@ -558,22 +684,57 @@ class PaperAPI:
     def download_file(self, build: BuildInfo, destination: Path) -> DownloadVerification:
         ensure_directory(destination.parent)
         request = Request(build.download_url, headers={"User-Agent": self.user_agent})
-        sha256 = hashlib.sha256()
-        bytes_written = 0
-        try:
-            with urlopen(request, timeout=self.timeout) as response, destination.open("wb") as handle:
-                while True:
-                    chunk = response.read(1024 * 1024)
-                    if not chunk:
-                        break
-                    sha256.update(chunk)
-                    bytes_written += len(chunk)
-                    handle.write(chunk)
-        except HTTPError as error:
-            detail = error.read().decode("utf-8", errors="ignore") if hasattr(error, "read") else ""
-            raise PaperScriptError(f"Download failed: HTTP {error.code} {detail}".strip()) from error
-        except URLError as error:
-            raise PaperScriptError(f"Download failed: {error.reason}") from error
+        for attempt in range(self.retries + 1):
+            sha256 = hashlib.sha256()
+            bytes_written = 0
+            started_at = time.monotonic()
+            try:
+                if self.debug_http:
+                    self._log_http(f"HTTP DOWNLOAD {attempt + 1}/{self.retries + 1}: {build.download_url}")
+                with urlopen(request, timeout=self.timeout) as response, destination.open("wb") as handle:
+                    while True:
+                        chunk = response.read(1024 * 1024)
+                        if not chunk:
+                            break
+                        sha256.update(chunk)
+                        bytes_written += len(chunk)
+                        handle.write(chunk)
+                elapsed_seconds = time.monotonic() - started_at
+                if self.debug_http:
+                    self._log_http(
+                        f"HTTP DOWNLOAD completed in {format_duration(elapsed_seconds)} "
+                        f"at {format_rate(bytes_written, elapsed_seconds)}: {build.download_url}"
+                    )
+                break
+            except HTTPError as error:
+                detail_raw = error.read().decode("utf-8", errors="ignore") if hasattr(error, "read") else ""
+                if destination.exists():
+                    destination.unlink()
+                if error.code in TRANSIENT_HTTP_CODES and attempt < self.retries:
+                    wait_seconds = self.retry_backoff_seconds * (2 ** attempt)
+                    self._log_http(
+                        f"Transient download error HTTP {error.code} for {build.download_url}. Retrying in {wait_seconds:.1f}s..."
+                    )
+                    time.sleep(wait_seconds)
+                    continue
+                detail = summarize_http_detail(detail_raw)
+                message = f"Download failed: HTTP {error.code}"
+                if detail:
+                    message += f" {detail}"
+                if error.code in TRANSIENT_HTTP_CODES:
+                    message += " The Paper API or Cloudflare may be having a temporary issue; please retry."
+                raise PaperScriptError(message) from error
+            except URLError as error:
+                if destination.exists():
+                    destination.unlink()
+                if attempt < self.retries:
+                    wait_seconds = self.retry_backoff_seconds * (2 ** attempt)
+                    self._log_http(
+                        f"Transient download network error for {build.download_url}: {error.reason}. Retrying in {wait_seconds:.1f}s..."
+                    )
+                    time.sleep(wait_seconds)
+                    continue
+                raise PaperScriptError(f"Download failed: {error.reason}") from error
 
         if build.sha256:
             digest = sha256.hexdigest()
@@ -581,9 +742,17 @@ class PaperAPI:
                 raise PaperScriptError(
                     f"Checksum mismatch for {build.filename}: expected {build.sha256}, got {digest}"
                 )
-            return DownloadVerification(sha256=digest, bytes_written=bytes_written)
+            return DownloadVerification(
+                sha256=digest,
+                bytes_written=bytes_written,
+                elapsed_seconds=elapsed_seconds,
+            )
 
-        return DownloadVerification(sha256=sha256.hexdigest(), bytes_written=bytes_written)
+        return DownloadVerification(
+            sha256=sha256.hexdigest(),
+            bytes_written=bytes_written,
+            elapsed_seconds=elapsed_seconds,
+        )
 
 
 def guess_version_group(version: str) -> str:
@@ -603,6 +772,14 @@ def normalize_choice(value: Any, allowed: set[str], default: str) -> str:
 def resolve_color_theme(name: Any) -> dict[str, str]:
     normalized = normalize_choice(name, set(COLOR_THEMES), "default")
     return COLOR_THEMES[normalized]
+
+
+def summarize_http_detail(detail: str) -> str:
+    cleaned = re.sub(r"<[^>]+>", " ", detail)
+    cleaned = " ".join(cleaned.split())
+    if not cleaned:
+        return ""
+    return f"{cleaned[:220]}..." if len(cleaned) > 220 else cleaned
 
 
 def normalize_global_options(argv: list[str]) -> list[str]:
@@ -665,6 +842,7 @@ class PaperScriptApp:
         self.color_theme_name = normalize_choice(self.config.get("color_theme"), set(COLOR_THEMES), "default")
         self.backups_dir = self.runtime_dir / str(self.config["backup_dir"])
         self.downloads_dir = self.runtime_dir / str(self.config["downloads_dir"])
+        self.metadata_cache_dir = self.runtime_dir / str(self.config["metadata_cache_dir"])
         self.log_path = self.runtime_dir / str(self.config["log_file"])
         self.logger = Logger(
             self.log_path,
@@ -674,6 +852,7 @@ class PaperScriptApp:
         )
         ensure_directory(self.backups_dir)
         ensure_directory(self.downloads_dir)
+        ensure_directory(self.metadata_cache_dir)
         self.state = self._load_json(self.state_path)
         self.server_name = self.config.get("server_name")
         self.default_channel = str(self.config["default_channel"]).upper()
@@ -693,15 +872,41 @@ class PaperScriptApp:
         self.default_status_view = normalize_choice(self.config.get("default_status_view"), {"full", "compact"}, "full")
         self.command_hint_mode = normalize_choice(self.config.get("command_hint_mode"), {"auto", "always", "never"}, "auto")
         self.release_link_mode = normalize_choice(self.config.get("release_link_mode"), {"auto", "always", "never"}, "auto")
+        self.debug_http = bool(args.debug_http or self.config.get("debug_http"))
+        self.metadata_cache_enabled = bool(self.config.get("metadata_cache_enabled", True)) and not bool(args.no_metadata_cache)
+        self.metadata_cache_ttl_seconds = int(self.config.get("metadata_cache_ttl_seconds", 300))
+        self.http_retries = int(self.config.get("http_retries", 2))
+        self.http_retry_backoff_seconds = float(self.config.get("http_retry_backoff_seconds", 1.5))
+        self.list_versions_channel_delay_ms = int(self.config.get("list_versions_channel_delay_ms", 150))
+        self.list_versions_continue_on_error = bool(self.config.get("list_versions_continue_on_error", True))
         self.http_timeout = int(args.timeout) if args.timeout is not None else int(self.config["http_timeout_seconds"])
         self.user_agent = self._resolve_user_agent()
-        self.api = PaperAPI(self.user_agent, timeout=self.http_timeout)
+        self.api = PaperAPI(
+            self.user_agent,
+            timeout=self.http_timeout,
+            logger=self.logger,
+            debug_http=self.debug_http,
+            retries=self.http_retries,
+            retry_backoff_seconds=self.http_retry_backoff_seconds,
+            cache_dir=self.metadata_cache_dir,
+            cache_ttl_seconds=self.metadata_cache_ttl_seconds,
+            cache_enabled=self.metadata_cache_enabled,
+        )
         self.tmux_session = (
             args.tmux_session
             or os.environ.get("PAPERSCRIPT_TMUX_SESSION")
             or self.config.get("tmux_session")
             or "mcserver"
         )
+
+    def log_api_activity(self, message: str) -> None:
+        if not self.logger.quiet:
+            self.logger.log(message)
+
+    def metadata_cache_file_count(self) -> int:
+        if not self.metadata_cache_dir.exists():
+            return 0
+        return sum(1 for path in self.metadata_cache_dir.iterdir() if path.is_file())
 
     def force_example_for_current(self, current: JarInfo | None) -> str | None:
         if current is None:
@@ -872,9 +1077,23 @@ class PaperScriptApp:
             "For a stable overview, run './paperscript.sh stable'. For an experimental overview, run './paperscript.sh experimental'."
         )
 
-    def list_versions(self, show_channels: bool = False) -> None:
+    def list_versions(
+        self,
+        show_channels: bool = False,
+        limit: int | None = None,
+        channel_delay_ms: int | None = None,
+    ) -> None:
+        self.log_api_activity("Contacting Paper API for version data...")
         versions = self.api.get_project_versions()
+        if limit is not None and limit > 0:
+            versions = versions[:limit]
         self.logger.log(f"Found {len(versions)} Paper versions from the API.")
+        failed_versions: list[tuple[str, str]] = []
+        effective_delay_ms = self.list_versions_channel_delay_ms if channel_delay_ms is None else channel_delay_ms
+        if show_channels:
+            self.log_api_activity(
+                f"Fetching channel summaries for {len(versions)} version(s). This may take a while if the API is slow."
+            )
         for item in versions:
             line = item["id"]
             extra: list[str] = []
@@ -886,13 +1105,32 @@ class PaperScriptApp:
             if minimum_java:
                 extra.append(f"java {minimum_java}+")
             if show_channels:
-                summaries = self.latest_channel_summaries(item["id"])
-                if summaries:
-                    extra.append(", ".join(summaries))
+                try:
+                    summaries = self.latest_channel_summaries(item["id"])
+                    if summaries:
+                        extra.append(", ".join(summaries))
+                except PaperScriptError as error:
+                    if not self.list_versions_continue_on_error:
+                        raise
+                    failed_versions.append((item["id"], str(error)))
+                    extra.append("channel lookup failed")
+                if effective_delay_ms > 0:
+                    time.sleep(effective_delay_ms / 1000)
             if extra:
                 self.logger.log(self.format_browser_entry("  - ", line, f" ({'; '.join(extra)})"))
             else:
                 self.logger.log(self.format_browser_entry("  - ", line))
+        if failed_versions:
+            self.logger.log(
+                f"Channel lookup failed for {len(failed_versions)} version(s). "
+                "The API may be throttling or returning temporary gateway errors."
+            )
+            sample_version, sample_error = failed_versions[0]
+            self.logger.log(f"First failed version: {sample_version}")
+            self.logger.log(f"First failure detail: {sample_error}")
+            self.logger.log(
+                "Try './paperscript.sh --debug-http list-versions --channels --limit 10' for a smaller verbose retry."
+            )
 
     def latest_channel_summaries(self, version: str) -> list[str]:
         builds = self.api.get_builds(version)
@@ -1366,6 +1604,7 @@ class PaperScriptApp:
             f"Downloading Paper {build.version} build #{build.build_id} "
             f"({build.channel}, {format_bytes(build.size)})..."
         )
+        install_started_at = time.monotonic()
         try:
             verification = self.api.download_file(build, temp_path)
         except Exception:
@@ -1380,15 +1619,21 @@ class PaperScriptApp:
         self.logger.log(
             f"Checksum verification: {'match' if not build.sha256 or verification.sha256.lower() == build.sha256.lower() else 'mismatch'}"
         )
+        self.logger.log(
+            f"Download timing: {format_duration(verification.elapsed_seconds)} at "
+            f"{format_rate(verification.bytes_written, verification.elapsed_seconds)}"
+        )
 
         self.backup_existing_jar(current, target_name)
         shutil.move(str(final_temp), str(target_path))
         self.logger.log(f"Installed {target_path}")
         self.record_state(build, target_path, verification.sha256)
         self.prune_old_backups()
+        self.logger.log(f"Total install timing: {format_duration(time.monotonic() - install_started_at)}")
 
     def run_update(self) -> None:
         self.describe_server_context()
+        self.log_api_activity("Contacting Paper API for the latest stable release...")
         target = self.choose_target_for_update()
         if target is None:
             self.logger.log("Update finished with no download or install changes.")
@@ -1420,10 +1665,12 @@ class PaperScriptApp:
         properties = parse_properties(self.server_dir / "server.properties")
         current = self.find_current_jar()
         running = self.detect_running_server_processes()
+        self.log_api_activity("Contacting Paper API for current release data...")
         latest_version, latest_build = self.latest_stable_version()
         latest_experimental_version, latest_experimental_build = self.latest_version_for_channel("ALPHA")
         tmux_available = self.tmux_session_available()
         backup_count = self.backup_file_count()
+        metadata_cache_count = self.metadata_cache_file_count()
         update_relevant = current is None
 
         self.logger.kv("PaperScript version", APP_RELEASE)
@@ -1526,6 +1773,11 @@ class PaperScriptApp:
             f"keep {self.keep_backups} backups, cleanup after install {format_bool(self.cleanup_backups_after_install)}",
         )
         self.logger.kv("Backups found", f"{backup_count} file(s)")
+        self.logger.kv(
+            "Metadata cache",
+            f"{'enabled' if self.metadata_cache_enabled else 'disabled'}, "
+            f"ttl {self.metadata_cache_ttl_seconds}s, files {metadata_cache_count}",
+        )
         if backup_count > 0:
             if self.keep_backups >= 0 and backup_count > self.keep_backups:
                 self.log_command_hint(
@@ -1537,8 +1789,14 @@ class PaperScriptApp:
                 self.log_command_hint(
                     "Run './paperscript.sh cleanup --backups' to delete all backup jars if you no longer need rollback copies."
                 )
+        if metadata_cache_count > 0 and not compact:
+            self.log_command_hint(
+                "Run './paperscript.sh cleanup --metadata-cache' to clear cached Paper API metadata, "
+                "or './paperscript.sh --no-metadata-cache ...' to bypass it for one run."
+            )
 
     def run_stable(self, download: bool = False) -> None:
+        self.log_api_activity("Contacting Paper API for the latest stable release...")
         version, build = self.latest_stable_version()
         self.logger.log(f"Latest stable release overall: {version} build #{build.build_id} ({format_bytes(build.size)})")
         self.logger.log(f"Download URL: {build.download_url}")
@@ -1552,6 +1810,7 @@ class PaperScriptApp:
             self.install_build(build, force_version_prompt=False, prompt_for_force_reinstall=True)
 
     def run_experimental(self, download: bool = False) -> None:
+        self.log_api_activity("Contacting Paper API for the latest experimental release...")
         version, build = self.latest_version_for_channel("ALPHA")
         self.logger.log(
             f"Latest experimental release overall: {version} build #{build.build_id} ({format_bytes(build.size)})"
@@ -1621,12 +1880,13 @@ class PaperScriptApp:
             "all": bool(getattr(self.args, "cleanup_all", False)),
             "downloads": bool(getattr(self.args, "cleanup_downloads", False)),
             "backups": bool(getattr(self.args, "cleanup_backups", False)),
+            "metadata_cache": bool(getattr(self.args, "cleanup_metadata_cache", False)),
             "pycache": bool(getattr(self.args, "cleanup_pycache", False)),
             "logs": bool(getattr(self.args, "cleanup_logs", False)),
             "json": bool(getattr(self.args, "cleanup_json", False)),
         }
         if selected["all"]:
-            for key in ["downloads", "backups", "pycache", "logs", "json"]:
+            for key in ["downloads", "backups", "metadata_cache", "pycache", "logs", "json"]:
                 selected[key] = True
         if getattr(self.args, "cleanup_keep", None) is not None:
             selected["backups"] = True
@@ -1645,6 +1905,8 @@ class PaperScriptApp:
                 descriptions.append(f"Delete all backup jars in {self.backups_dir}")
             else:
                 descriptions.append(f"Trim backup jars in {self.backups_dir} so only the newest {keep} remain")
+        if selection["metadata_cache"]:
+            descriptions.append(f"Delete cached Paper API metadata in {self.metadata_cache_dir}")
         if selection["pycache"]:
             descriptions.append(f"Delete Python __pycache__ folders under {self.runtime_dir}")
         if selection["logs"]:
@@ -1752,6 +2014,7 @@ class PaperScriptApp:
 
         removed_downloads = 0
         removed_backups = 0
+        removed_metadata_cache = 0
         removed_pycache = 0
         cleared_logs = False
         removed_json = 0
@@ -1769,6 +2032,10 @@ class PaperScriptApp:
                 self.logger.log(
                     f"Removed {removed_backups} old backup item(s) from {self.backups_dir} and kept the newest {self.args.cleanup_keep}"
                 )
+
+        if selection["metadata_cache"]:
+            removed_metadata_cache = self.remove_directory_contents(self.metadata_cache_dir)
+            self.logger.log(f"Removed {removed_metadata_cache} item(s) from {self.metadata_cache_dir}")
 
         if selection["pycache"]:
             for pycache_dir in self.find_pycache_dirs():
@@ -1791,6 +2058,7 @@ class PaperScriptApp:
             "Cleanup finished: "
             f"downloads={removed_downloads}, "
             f"backups={removed_backups}, "
+            f"metadata_cache={removed_metadata_cache}, "
             f"pycache={removed_pycache}, "
             f"json={removed_json}, "
             f"logs={'cleared' if cleared_logs else 'unchanged'}"
@@ -1858,6 +2126,16 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Disable ANSI colors in terminal output.",
     )
+    parser.add_argument(
+        "--debug-http",
+        action="store_true",
+        help="Log HTTP request attempts and retries for Paper API troubleshooting.",
+    )
+    parser.add_argument(
+        "--no-metadata-cache",
+        action="store_true",
+        help="Bypass the local Paper API metadata cache for this run.",
+    )
 
     subparsers = parser.add_subparsers(dest="command")
 
@@ -1917,6 +2195,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="Delete all files in backups/, or trim them when used with --keep.",
     )
     cleanup_parser.add_argument(
+        "--metadata-cache",
+        dest="cleanup_metadata_cache",
+        action="store_true",
+        help="Delete cached Paper API metadata in cache/.",
+    )
+    cleanup_parser.add_argument(
         "--keep",
         dest="cleanup_keep",
         type=int,
@@ -1948,6 +2232,18 @@ def build_parser() -> argparse.ArgumentParser:
         "--channels",
         action="store_true",
         help="Also show the newest build per channel for each version.",
+    )
+    list_parser.add_argument(
+        "--limit",
+        type=int,
+        default=None,
+        help="Limit how many versions are listed. Useful with --channels when debugging API throttling.",
+    )
+    list_parser.add_argument(
+        "--channel-delay-ms",
+        type=int,
+        default=None,
+        help="Pause this many milliseconds between per-version channel lookups. Useful with --channels.",
     )
 
     inspect_parser = subparsers.add_parser("inspect", help="Show the latest builds for one version.")
@@ -1994,7 +2290,11 @@ def main() -> int:
         elif args.command == "cleanup":
             app.run_cleanup()
         elif args.command == "list-versions":
-            app.list_versions(show_channels=args.channels)
+            app.list_versions(
+                show_channels=args.channels,
+                limit=args.limit,
+                channel_delay_ms=args.channel_delay_ms,
+            )
         elif args.command == "inspect":
             app.inspect_version(args.version, offer_download=True)
         elif args.command == "explore":

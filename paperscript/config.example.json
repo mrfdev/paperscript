@@ -15,6 +15,9 @@
   "log_file": "logs.log",
   "backup_dir": "backups",
   "downloads_dir": "downloads",
+  "metadata_cache_dir": "cache",
+  "metadata_cache_enabled": true,
+  "metadata_cache_ttl_seconds": 300,
   "confirm_before_force_download": true,
   "confirm_before_downgrade": true,
   "auto_detect_server_by_port": true,
@@ -24,5 +27,10 @@
   "color_theme": "default",
   "default_status_view": "full",
   "command_hint_mode": "auto",
-  "release_link_mode": "auto"
+  "release_link_mode": "auto",
+  "debug_http": false,
+  "http_retries": 2,
+  "http_retry_backoff_seconds": 1.5,
+  "list_versions_channel_delay_ms": 150,
+  "list_versions_continue_on_error": true
 }
