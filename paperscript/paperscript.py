@@ -1019,20 +1019,43 @@ class PaperScriptApp:
         )
         self._save_json(self.state_path, self.state)
 
+    def jar_info_from_state(self, path: Path) -> JarInfo | None:
+        state_name = self.state.get("current_jar")
+        if not state_name or path.name != str(state_name):
+            return None
+
+        version = self.state.get("current_version")
+        build = self.state.get("current_build")
+        if not version or build is None:
+            return None
+
+        try:
+            build_number = int(build)
+        except (TypeError, ValueError):
+            return None
+
+        return JarInfo(path, str(version), build_number)
+
+    def jar_info_from_filename(self, path: Path) -> JarInfo | None:
+        match = CURRENT_JAR_PATTERN.match(path.name)
+        if match:
+            return JarInfo(path, match.group(1), int(match.group(2)))
+        return self.jar_info_from_state(path)
+
     def find_current_jar(self) -> JarInfo | None:
         state_name = self.state.get("current_jar")
         if state_name:
             state_path = self.server_dir / state_name
-            match = CURRENT_JAR_PATTERN.match(state_path.name)
-            if state_path.exists() and match:
-                return JarInfo(state_path, match.group(1), int(match.group(2)))
+            if state_path.exists():
+                state_jar = self.jar_info_from_filename(state_path)
+                if state_jar:
+                    return state_jar
 
         candidates: list[JarInfo] = []
         for path in self.server_dir.glob("*.jar"):
-            match = CURRENT_JAR_PATTERN.match(path.name)
-            if not match:
-                continue
-            candidates.append(JarInfo(path, match.group(1), int(match.group(2))))
+            jar = self.jar_info_from_filename(path)
+            if jar:
+                candidates.append(jar)
         if not candidates:
             return None
 

@@ -123,7 +123,7 @@ Checks the server directory, detects the latest stable Paper release, and instal
 
 Behavior:
 
-- If no current `Paper-<version>-<build>.jar` exists, it offers the latest stable build.
+- If no current Paper jar is detected, it offers the latest stable build.
 - If your current version matches the newest stable version, it only downloads when the build number is newer.
 - If your current version and build already match the newest stable release, `--force update` re-downloads it.
 - If the newest stable version is a newer Minecraft version, PaperScript asks before upgrading.
@@ -578,6 +578,8 @@ Useful per-server settings:
   Enable or disable the local Paper API metadata cache
 - `metadata_cache_ttl_seconds`
   How long cached metadata stays valid before PaperScript refreshes it
+- `download_filename_pattern`
+  Controls the installed jar name, for example `Paper-{version}-{build}.jar` or `Paper-{version}.jar`
 - `quiet`
   Make unattended runs silent by default
 - `no_color`
