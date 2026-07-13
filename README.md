@@ -40,7 +40,7 @@ Bash still has a place here, which is why the launcher remains a simple `papersc
 - Sends a custom User-Agent by default:
   `mrfloris-PaperScript/2.0 (https://github.com/mrfdev/PaperScript)`
 - Finds the latest stable Paper version and latest stable build automatically.
-- Can inspect and install the latest experimental release overall.
+- Can inspect and install the latest experimental release overall, preferring `BETA` and falling back to `ALPHA`.
 - Only auto-updates when the stable build is newer for the same version.
 - Prompts before cross-version upgrades.
 - Prompts before downgrades.
@@ -200,6 +200,8 @@ Examples:
 ### `experimental`
 
 Shows the latest experimental Paper release overall and can install it directly.
+
+PaperScript now prefers the newest `BETA` release for this command and only falls back to `ALPHA` if no beta build exists.
 
 This is different from the `ALPHA` line shown under the latest stable version in `status`.
 

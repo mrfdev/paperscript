@@ -1082,6 +1082,14 @@ class PaperScriptApp:
                 return version, build
         raise PaperScriptError(f"No {channel_upper} Paper builds were found.")
 
+    def latest_experimental_version(self) -> tuple[str, BuildInfo]:
+        for channel in ["BETA", "ALPHA"]:
+            try:
+                return self.latest_version_for_channel(channel)
+            except PaperScriptError:
+                continue
+        raise PaperScriptError("No BETA or ALPHA Paper builds were found.")
+
     def describe_server_context(self) -> None:
         has_server_properties = (self.server_dir / "server.properties").exists()
         current_jar = self.find_current_jar()
@@ -1690,7 +1698,7 @@ class PaperScriptApp:
         running = self.detect_running_server_processes()
         self.log_api_activity("Contacting Paper API for current release data...")
         latest_version, latest_build = self.latest_stable_version()
-        latest_experimental_version, latest_experimental_build = self.latest_version_for_channel("ALPHA")
+        latest_experimental_version, latest_experimental_build = self.latest_experimental_version()
         tmux_available = self.tmux_session_available()
         backup_count = self.backup_file_count()
         metadata_cache_count = self.metadata_cache_file_count()
@@ -1786,7 +1794,7 @@ class PaperScriptApp:
                     )
         self.logger.kv(
             "Latest experimental release",
-            f"{latest_experimental_version} build #{latest_experimental_build.build_id}",
+            f"{latest_experimental_version} build #{latest_experimental_build.build_id} ({latest_experimental_build.channel})",
         )
         self.log_command_hint(
             "Use './paperscript.sh experimental' to inspect it, or './paperscript.sh experimental --download' to install it."
@@ -1834,14 +1842,17 @@ class PaperScriptApp:
 
     def run_experimental(self, download: bool = False) -> None:
         self.log_api_activity("Contacting Paper API for the latest experimental release...")
-        version, build = self.latest_version_for_channel("ALPHA")
+        version, build = self.latest_experimental_version()
         self.logger.log(
-            f"Latest experimental release overall: {version} build #{build.build_id} ({format_bytes(build.size)})"
+            f"Latest experimental release overall: {version} build #{build.build_id} ({build.channel}, {format_bytes(build.size)})"
         )
         self.logger.log(f"Download URL: {build.download_url}")
         if build.sha256:
             self.logger.log(f"Expected SHA-256: {build.sha256}")
-        self.log_command_hint(f"Exact manual command: ./paperscript.sh download --version {version} --channel ALPHA", important=True)
+        self.log_command_hint(
+            f"Exact manual command: ./paperscript.sh download --version {version} --channel {build.channel}",
+            important=True,
+        )
         self.log_release_page(relevant=True)
         if download:
             self.install_build(build, force_version_prompt=True, prompt_for_force_reinstall=True)
