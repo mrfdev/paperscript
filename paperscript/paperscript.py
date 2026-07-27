@@ -1082,13 +1082,16 @@ class PaperScriptApp:
                 return version, build
         raise PaperScriptError(f"No {channel_upper} Paper builds were found.")
 
-    def latest_experimental_version(self) -> tuple[str, BuildInfo]:
-        for channel in ["BETA", "ALPHA"]:
-            try:
-                return self.latest_version_for_channel(channel)
-            except PaperScriptError:
+    def latest_preview_version(self, stable_version: str) -> tuple[str, BuildInfo] | None:
+        versions = [item["id"] for item in self.api.get_project_versions()]
+        for version in versions:
+            if compare_versions(version, stable_version) <= 0:
                 continue
-        raise PaperScriptError("No BETA or ALPHA Paper builds were found.")
+            for channel in ["BETA", "ALPHA"]:
+                build = self.api.get_latest_build(version, channel=channel)
+                if build:
+                    return version, build
+        return None
 
     def describe_server_context(self) -> None:
         has_server_properties = (self.server_dir / "server.properties").exists()
@@ -1105,7 +1108,7 @@ class PaperScriptApp:
         else:
             self.logger.log("Detected current jar: none")
         self.log_command_hint(
-            "For a stable overview, run './paperscript.sh stable'. For an experimental overview, run './paperscript.sh experimental'."
+            "For a stable overview, run './paperscript.sh stable'. For a preview overview, run './paperscript.sh experimental'."
         )
 
     def list_versions(
@@ -1698,7 +1701,7 @@ class PaperScriptApp:
         running = self.detect_running_server_processes()
         self.log_api_activity("Contacting Paper API for current release data...")
         latest_version, latest_build = self.latest_stable_version()
-        latest_experimental_version, latest_experimental_build = self.latest_experimental_version()
+        latest_preview = self.latest_preview_version(latest_version)
         tmux_available = self.tmux_session_available()
         backup_count = self.backup_file_count()
         metadata_cache_count = self.metadata_cache_file_count()
@@ -1792,13 +1795,23 @@ class PaperScriptApp:
                         f"build #{build.build_id}, {format_bytes(build.size)}",
                         width=14,
                     )
-        self.logger.kv(
-            "Latest experimental release",
-            f"{latest_experimental_version} build #{latest_experimental_build.build_id} ({latest_experimental_build.channel})",
-        )
-        self.log_command_hint(
-            "Use './paperscript.sh experimental' to inspect it, or './paperscript.sh experimental --download' to install it."
-        )
+        if latest_preview is None:
+            self.logger.kv(
+                "Latest preview release",
+                f"none newer than stable ({latest_version} build #{latest_build.build_id})",
+            )
+            self.log_command_hint(
+                f"Use './paperscript.sh inspect {latest_version}' to browse older beta or alpha channels for the current stable line."
+            )
+        else:
+            latest_preview_version, latest_preview_build = latest_preview
+            self.logger.kv(
+                "Latest preview release",
+                f"{latest_preview_version} build #{latest_preview_build.build_id} ({latest_preview_build.channel})",
+            )
+            self.log_command_hint(
+                "Use './paperscript.sh experimental' to inspect it, or './paperscript.sh experimental --download' to install it."
+            )
         self.logger.kv(
             "Backup retention",
             f"keep {self.keep_backups} backups, cleanup after install {format_bool(self.cleanup_backups_after_install)}",
@@ -1841,10 +1854,21 @@ class PaperScriptApp:
             self.install_build(build, force_version_prompt=False, prompt_for_force_reinstall=True)
 
     def run_experimental(self, download: bool = False) -> None:
-        self.log_api_activity("Contacting Paper API for the latest experimental release...")
-        version, build = self.latest_experimental_version()
+        self.log_api_activity("Contacting Paper API for the latest preview release newer than stable...")
+        stable_version, stable_build = self.latest_stable_version()
+        preview = self.latest_preview_version(stable_version)
+        if preview is None:
+            self.logger.log(
+                f"No preview release newer than the current stable release was found. Stable is {stable_version} build #{stable_build.build_id}."
+            )
+            self.log_command_hint(
+                f"Use './paperscript.sh stable' for the current mainline release, or './paperscript.sh inspect {stable_version}' to browse older beta or alpha builds on that stable line."
+            )
+            return
+
+        version, build = preview
         self.logger.log(
-            f"Latest experimental release overall: {version} build #{build.build_id} ({build.channel}, {format_bytes(build.size)})"
+            f"Latest preview release newer than stable: {version} build #{build.build_id} ({build.channel}, {format_bytes(build.size)})"
         )
         self.logger.log(f"Download URL: {build.download_url}")
         if build.sha256:
@@ -2199,12 +2223,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     experimental_parser = subparsers.add_parser(
         "experimental",
-        help="Show or download the latest experimental Paper release overall.",
+        help="Show or download the latest preview Paper release that is newer than the current stable release.",
     )
     experimental_parser.add_argument(
         "--download",
         action="store_true",
-        help="Download and install the latest experimental release overall.",
+        help="Download and install the latest preview release that is newer than the current stable release.",
     )
     cleanup_parser = subparsers.add_parser(
         "cleanup",
@@ -2281,7 +2305,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
 
     inspect_parser = subparsers.add_parser("inspect", help="Show the latest builds for one version.")
-    inspect_parser.add_argument("version", help="Minecraft version to inspect, for example 1.20.4 or 26.1.2")
+    inspect_parser.add_argument("version", help="Minecraft version to inspect, for example 26.2 or 1.20.4")
 
     subparsers.add_parser("explore", help="Interactively pick a version, inspect it, and optionally download it.")
     init_parser = subparsers.add_parser(

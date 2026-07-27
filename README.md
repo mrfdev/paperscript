@@ -7,7 +7,7 @@ It is designed for the layout where your server root stays readable, while Paper
 ```text
 /anydirectory/
 /anydirectory/server.properties
-/anydirectory/Paper-1.21.11-130.jar
+/anydirectory/Paper-26.2-84.jar
 /anydirectory/paperscript.sh
 /anydirectory/paperscript/
 /anydirectory/paperscript/paperscript.py
@@ -40,7 +40,7 @@ Bash still has a place here, which is why the launcher remains a simple `papersc
 - Sends a custom User-Agent by default:
   `mrfloris-PaperScript/2.0 (https://github.com/mrfdev/PaperScript)`
 - Finds the latest stable Paper version and latest stable build automatically.
-- Can inspect and install the latest experimental release overall, preferring `BETA` and falling back to `ALPHA`.
+- Can inspect and install the latest preview release that is newer than the current stable line, preferring `BETA` and falling back to `ALPHA`.
 - Only auto-updates when the stable build is newer for the same version.
 - Prompts before cross-version upgrades.
 - Prompts before downgrades.
@@ -83,6 +83,29 @@ If you want to initialize or repair the runtime files manually:
 
 That creates or repairs the local runtime pieces in `paperscript/` and asks for confirmation before it changes anything.
 
+## Refreshing An Existing Live Server
+
+If you already run a live server and want to replace an older local PaperScript checkout with a fresh copy from GitHub, the normal safe path is:
+
+```bash
+./paperscript.sh status
+./paperscript.sh update --dry-run
+./paperscript.sh update
+```
+
+For servers that use the default jar naming pattern, such as `Paper-26.2-84.jar`, a fresh PaperScript checkout can detect the current jar, back it up, and replace it with the newest stable build.
+
+If your server uses a custom installed jar name such as `Paper-26.2.jar`, keep your local `paperscript/config.json` and `paperscript/state.json` or restore their equivalent settings after refreshing the checkout. In particular, if you changed:
+
+- `download_filename_pattern`
+- `default_channel`
+- `check_latest_channel_only`
+- `tmux_session`
+
+then deleting the whole `paperscript/` runtime directory will also delete those per-server preferences.
+
+If you intentionally want a completely fresh PaperScript runtime, re-check `./paperscript.sh status` before `update` so you can confirm that the detected current jar and target install name still match your server layout.
+
 ## Quick Start
 
 Show the current state:
@@ -103,13 +126,13 @@ Force a re-download of the current latest stable build:
 ./paperscript.sh --force update
 ```
 
-Inspect the latest experimental release:
+Inspect the latest preview release beyond stable:
 
 ```bash
 ./paperscript.sh experimental
 ```
 
-Download that experimental build:
+Download that preview build:
 
 ```bash
 ./paperscript.sh experimental --download
@@ -144,7 +167,7 @@ Examples:
 
 ### `status`
 
-Shows the current PaperScript and Paper server state, the newest stable release, and the newest experimental release overall.
+Shows the current PaperScript and Paper server state, the newest stable release, and the newest preview release beyond stable when one exists.
 
 The normal full view can include:
 
@@ -161,7 +184,7 @@ The normal full view can include:
 - newest stable release
 - update status
 - newest channels for the current stable version
-- newest experimental release overall
+- newest preview release beyond stable
 - backup retention settings
 - backup file count and cleanup suggestions when useful
 
@@ -199,16 +222,16 @@ Examples:
 
 ### `experimental`
 
-Shows the latest experimental Paper release overall and can install it directly.
+This command name is kept for compatibility, but it now behaves like a preview-channel helper.
 
-PaperScript now prefers the newest `BETA` release for this command and only falls back to `ALPHA` if no beta build exists.
+It looks for the latest non-stable Paper release that is newer than the current stable line. It prefers `BETA` and only falls back to `ALPHA` if no beta build exists.
 
-This is different from the `ALPHA` line shown under the latest stable version in `status`.
+If the current stable release is already the newest line, PaperScript says so instead of pointing you at an older beta build from that same now-stable version.
 
 For example:
 
-- `Latest channels for stable version 1.21.11` means the channels that exist for `1.21.11`
-- `Latest experimental release overall` may instead be something newer like `26.1.2 build #7`
+- `Latest channels for stable version 26.2` means the channels that exist for `26.2`
+- `Latest preview release` is only shown when a newer not-yet-stable line exists beyond the current stable release
 
 Examples:
 
@@ -258,8 +281,8 @@ Because `--channels` performs many API requests, PaperScript now:
 This is useful for questions like:
 
 - which versions exist at all
-- whether `26.2.x` only exists as alpha or beta
-- whether `26.1.2` is the newest stable or experimental family
+- whether a future `26.3.x` line only exists as alpha or beta
+- whether `26.2` is still the newest stable family or a newer preview line has appeared
 - whether older versions such as `1.20.4` or `1.19.2` still have builds available
 
 ### `inspect VERSION`
@@ -271,9 +294,9 @@ If the selected build is already installed, PaperScript can offer a direct `Down
 Examples:
 
 ```bash
+./paperscript.sh inspect 26.2
 ./paperscript.sh inspect 1.20.4
 ./paperscript.sh inspect 1.19.2
-./paperscript.sh inspect 26.1.2
 ```
 
 ### `explore`
@@ -295,13 +318,13 @@ Downloads a chosen version or exact build on demand.
 Examples:
 
 ```bash
-./paperscript.sh download --version 26.1.2
+./paperscript.sh download --version 26.2
 ./paperscript.sh download --version 1.20.4
 ./paperscript.sh download --version 1.20.4 --build 123
-./paperscript.sh download --version 26.2.1 --channel BETA
-./paperscript.sh --force download --version 26.1.2
-./paperscript.sh --force download --version 1.21.11 --build 130
-./paperscript.sh download --version 1.21.11 --build 130 --force --yes
+./paperscript.sh download --version 26.2 --channel BETA
+./paperscript.sh --force download --version 26.2
+./paperscript.sh --force download --version 26.2 --build 84
+./paperscript.sh download --version 26.2 --build 84 --force --yes
 ```
 
 Notes:
@@ -613,7 +636,7 @@ If you already have a jar installed but want the same file again anyway, use one
 ./paperscript.sh --force update
 ./paperscript.sh --force stable --download
 ./paperscript.sh --force experimental --download
-./paperscript.sh --force download --version 1.21.11 --build 130
+./paperscript.sh --force download --version 26.2 --build 84
 ./paperscript.sh stable --download --yes --force
 ```
 
@@ -648,6 +671,8 @@ See whether a newer version family exists before touching production:
 ./paperscript.sh stable
 ./paperscript.sh experimental
 ```
+
+If `experimental` reports that no preview release newer than stable exists, that means the current stable line, such as `26.2`, is already the newest main target.
 
 Inspect an older branch:
 
