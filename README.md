@@ -179,7 +179,7 @@ The normal full view can include:
 - server properties detection
 - configured server port
 - running server detection
-- current jar, version, build, and SHA-256
+- current jar, full path, version, build, recorded install channel, and SHA-256
 - stored expected SHA-256 from the last PaperScript install
 - newest stable release
 - update status
@@ -248,6 +248,7 @@ Hashes the current installed jar and compares it against:
 
 - the SHA-256 recorded in `state.json` during the last PaperScript install
 - the expected SHA-256 from the live Paper API for that exact version and build
+- the recorded install channel and current channel reported by the API
 
 Examples:
 
@@ -691,6 +692,36 @@ Target a separate server directory:
 ```bash
 ./paperscript.sh --server-dir /Users/you/minecraft/test-server update
 ```
+
+## Testing
+
+PaperScript does not keep a Minecraft server, world, plugin directory, or reusable server template in this repository. Those files would be large, environment-specific, and too easy to mix with production data. Tests use disposable server directories instead.
+
+Run the dependency-free unit and drift checks:
+
+```bash
+python3 -m unittest discover -s tests -p 'test_*.py' -v
+bash -n paperscript.sh tests/live-smoke.sh
+python3 -m py_compile paperscript/paperscript.py tests/test_paperscript.py
+```
+
+The unit suite verifies version ordering, stable-channel defaults, same-version build-upgrade behavior, preview selection, both supported jar naming styles, saved channel metadata, and agreement between runtime, tracked, and documented config defaults.
+
+Run the opt-in live PaperMC smoke test:
+
+```bash
+./tests/live-smoke.sh
+```
+
+The live test creates a temporary server root, uses `STABLE` for both release checks, enables same-version build upgrades, and deliberately uses the per-server compatibility pattern `Paper-{version}.jar`. It then downloads the latest stable Paper release, verifies its SHA-256, confirms `status` detects its version/build/channel/path, and runs `verify`. The temporary jar and runtime files are removed afterward.
+
+To retain the disposable directory for troubleshooting:
+
+```bash
+PAPERSCRIPT_SMOKE_KEEP=1 ./tests/live-smoke.sh
+```
+
+GitHub Actions runs the network-free unit and syntax checks on current macOS and Ubuntu runners with the minimum supported Python 3.9. The full live download remains opt-in so routine CI does not repeatedly download a Paper server jar or add avoidable load to PaperMC.
 
 ## Todo
 

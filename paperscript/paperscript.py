@@ -22,8 +22,8 @@ from urllib.request import Request, urlopen
 
 
 APP_NAME = "PaperScript"
-APP_VERSION = "5.0.1"
-APP_BUILD = "049"
+APP_VERSION = "5.0.2"
+APP_BUILD = "050"
 APP_RELEASE = f"{APP_VERSION} build {APP_BUILD}"
 API_ROOT = "https://fill.papermc.io/v3/projects/paper"
 PROJECT_URL = "https://github.com/mrfdev/PaperScript"
@@ -1008,6 +1008,7 @@ class PaperScriptApp:
         self.state.update(
             {
                 "current_build": build.build_id,
+                "current_channel": build.channel,
                 "current_jar": installed_path.name,
                 "current_version": build.version,
                 "installed_at": utc_now(),
@@ -1722,15 +1723,21 @@ class PaperScriptApp:
                 for pid, command in running:
                     self.logger.kv(f"  PID {pid}", command)
         if current:
+            state_jar = self.state.get("current_jar")
+            state_channel = self.state.get("current_channel") if state_jar == current.path.name else None
+            current_details = f"{current.path.name} (version {current.version}, build #{current.build}"
+            if state_channel:
+                current_details += f", channel {str(state_channel).upper()}"
+            current_details += ")"
             self.logger.kv(
                 "Current jar",
-                f"{current.path.name} (version {current.version}, build #{current.build})",
+                current_details,
             )
             current_sha = sha256_file(current.path)
             if not compact:
+                self.logger.kv("Current jar path", str(current.path))
                 self.logger.kv("Current jar SHA-256", current_sha)
             expected_sha = self.state.get("expected_sha256")
-            state_jar = self.state.get("current_jar")
             if expected_sha and state_jar == current.path.name and not compact:
                 self.logger.kv("Expected SHA-256", str(expected_sha))
                 self.logger.kv(
@@ -1893,9 +1900,12 @@ class PaperScriptApp:
         self.logger.log(f"Current SHA-256: {current_sha}")
 
         state_jar = self.state.get("current_jar")
+        state_channel = self.state.get("current_channel")
         state_expected = self.state.get("expected_sha256")
         state_current = self.state.get("current_sha256")
         if state_jar == current.path.name:
+            if state_channel:
+                self.logger.log(f"Recorded install channel: {str(state_channel).upper()}")
             if not state_current and not state_expected:
                 self.logger.log("Recorded install state exists for this jar, but it does not contain stored SHA-256 values yet.")
             if state_current:
@@ -1923,6 +1933,7 @@ class PaperScriptApp:
             self.logger.log("API checksum verification: unavailable for this jar or the API could not be reached.")
             return
 
+        self.logger.log(f"API channel: {api_build.channel}")
         self.logger.log(f"API download URL: {api_build.download_url}")
         if api_build.sha256:
             self.logger.log(f"API expected SHA-256: {api_build.sha256}")
