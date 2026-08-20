@@ -729,10 +729,14 @@ PaperScript keeps a live local todo file at [paperscript/todo.log](./paperscript
 
 Current queued ideas include:
 
-- optional update scheduling or smarter unattended workflows
-- extra selective cleanup and repair helpers
-- richer tmux and server control helpers such as start, stop, and restart
-- additional smoke-test or planner-style validation modes
+- manual, non-disruptive staging of versioned Paper jars without stopping the server
+- transactional downloads, per-server locking, atomic state, and path containment
+- latest-build selection in the canonical `1MB-minecraft.sh` for the configured Minecraft version
+- read-only doctor checks, actionable verification results, and machine-readable status
+- broader failure-injection, CLI integration, and launcher compatibility tests
+
+Full server, world, plugin, and BlueMap backups remain a separate operational concern so
+staging a new Paper jar does not wait for very large backup jobs.
 
 ## API Notes
 

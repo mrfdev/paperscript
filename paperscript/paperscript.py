@@ -85,12 +85,70 @@ COLOR_THEMES: dict[str, dict[str, str]] = {
         "hint": ANSI_YELLOW,
     },
 }
-TODO_TEMPLATE = """PaperScript todo
+TODO_TEMPLATE = """PaperScript production todo
 
-- Future automation: optional update scheduling or smarter unattended workflows.
-- Future cleanup polish: extra selective cleanup and repair helpers beyond the current safe set.
-- Future tmux/server control: start, stop, restart, and richer session management helpers.
-- Future validation mode: additional smoke-test or planner mode beyond today's dry-run behavior.
+Product direction and boundaries
+
+- [ ] Keep PaperScript manually invoked. Remove cron, scheduling, and unattended-update recommendations.
+- [ ] Make update a non-disruptive staging operation: download and verify a new
+      Paper-<version>-<build>.jar beside the active jar while the server keeps running.
+      PaperScript must not stop, kill, start, or restart the server, and must not replace
+      the jar currently in use.
+- [ ] Keep tmux lifecycle control manual and external to PaperScript. PaperScript may use
+      tmux information for read-only status and doctor checks, but update must not send
+      stop or start commands.
+- [ ] Keep full server, world, plugin, and BlueMap backup orchestration separate. A quick
+      Paper jar download must not wait for hundreds of gigabytes of backup work. Limit
+      PaperScript itself to safe jar retention and cleanup.
+
+Safe jar staging
+
+- [ ] Add a per-server exclusive lock so overlapping manual runs cannot share, remove,
+      or overwrite each other's staged downloads or state.
+- [ ] Make staging transactional: preflight disk space and permissions, download to a
+      unique temporary file, require the Paper API SHA-256, verify size and jar structure,
+      fsync, then atomically rename to Paper-<version>-<build>.jar.
+- [ ] Write config, state, and metadata cache atomically with temp files, fsync, and
+      os.replace; preserve and report corrupt JSON instead of silently replacing it.
+- [ ] Validate and contain every configured path. Reject filesystem roots, traversal,
+      unsafe symlinks, and jar filename patterns that are not plain .jar basenames.
+- [ ] Namespace runtime state and locks by canonical server directory so one PaperScript
+      checkout can safely target more than one server.
+
+1MB-minecraft.sh integration
+
+- [ ] Update the canonical 1MB-minecraft.sh so, for its configured Minecraft version, it
+      recognizes Paper-<version>-<numeric-build>.jar and selects the greatest numeric build
+      on the next manual start. Never select a jar from another Minecraft version.
+- [ ] Preserve compatibility with the existing paper-<version>.jar naming fallback, ignore
+      .part and malformed files, handle case consistently, and use numeric rather than
+      lexicographic build ordering.
+- [ ] Add launcher tests for multiple builds, multiple Minecraft versions, legacy fallback,
+      malformed names, and build-number boundaries such as 9 versus 10.
+- [ ] Apply the launcher change at its canonical source and propagate it through the normal
+      1MB-minecraft.sh release/update flow rather than editing every generated server copy.
+
+Validation and operator feedback
+
+- [ ] Add a read-only doctor command covering supported Java version, disk space,
+      permissions, API access, config/state validity, active and staged jars, and tmux
+      identity without controlling the tmux session.
+- [ ] Make verify fail closed: require a valid SHA-256 for production downloads and return
+      nonzero status for mismatch or unverifiable state.
+- [ ] Add machine-readable JSON output and documented exit codes for current, update
+      available, staged, no-op, mismatch, degraded/API unavailable, and invalid config.
+- [ ] Add offline/degraded status with stale-cache fallback, log rotation and severity/run
+      IDs, a --version option, supported-Python CI, and reproducible tagged releases with
+      checksummed artifacts.
+
+Tests
+
+- [ ] Add hermetic CLI integration tests using a local HTTP fixture and disposable server
+      roots for download retries, corrupt responses/cache, checksum mismatch, and exits.
+- [ ] Add failure-injection tests for concurrent runs, signals at every staging boundary,
+      full disks, path traversal and symlinks, corrupt JSON, and cross-filesystem paths.
+- [ ] Add manual or scheduled project CI smoke coverage for Java/Paper compatibility without
+      turning server updates themselves into scheduled production automation.
 """
 DEFAULT_CONFIG: dict[str, Any] = {
     "server_name": None,
