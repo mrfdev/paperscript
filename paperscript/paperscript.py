@@ -1,29 +1,34 @@
 #!/usr/bin/env python3
-"""PaperScript: a PaperMC updater focused on safe, interactive server upgrades."""
+"""PaperScript: manually stage verified PaperMC jars without controlling the server."""
 
 from __future__ import annotations
 
 import argparse
+import fcntl
 import hashlib
+import http.client
 import json
+import math
 import os
 import re
 import shutil
-import signal
+import stat
 import subprocess
 import sys
+import tempfile
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator, TextIO
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
 
 APP_NAME = "PaperScript"
-APP_VERSION = "5.0.2"
-APP_BUILD = "050"
+APP_VERSION = "5.1.0"
+APP_BUILD = "051"
 APP_RELEASE = f"{APP_VERSION} build {APP_BUILD}"
 API_ROOT = "https://fill.papermc.io/v3/projects/paper"
 PROJECT_URL = "https://github.com/mrfdev/PaperScript"
@@ -46,6 +51,17 @@ COMMAND_NAMES = {
     "download",
 }
 CURRENT_JAR_PATTERN = re.compile(r"^paper-(.+)-(\d+)\.jar$", re.IGNORECASE)
+LEGACY_JAR_PATTERN = re.compile(r"^paper-(.+)\.jar$", re.IGNORECASE)
+SAFE_VERSION_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+LAST_LAUNCHED_JAR_MARKER = "last-launched-jar.txt"
+LAUNCHER_MARKER_ROLLBACK = ".launcher-marker-rollback"
+DEPRECATED_CONFIG_KEYS = {
+    "allow_cross_version_auto_upgrade",
+    "cleanup_backups_after_install",
+    "running_server_action",
+    "graceful_stop_command",
+    "download_filename_pattern",
+}
 ANSI_RESET = "\033[0m"
 ANSI_BOLD = "\033[1m"
 ANSI_DIM = "\033[2m"
@@ -89,30 +105,31 @@ TODO_TEMPLATE = """PaperScript production todo
 
 Product direction and boundaries
 
-- [ ] Keep PaperScript manually invoked. Remove cron, scheduling, and unattended-update recommendations.
-- [ ] Make update a non-disruptive staging operation: download and verify a new
+- [x] Keep PaperScript manually invoked. Remove cron, scheduling, and unattended-update recommendations.
+- [x] Make update a non-disruptive staging operation: download and verify a new
       Paper-<version>-<build>.jar beside the active jar while the server keeps running.
       PaperScript must not stop, kill, start, or restart the server, and must not replace
       the jar currently in use.
-- [ ] Keep tmux lifecycle control manual and external to PaperScript. PaperScript may use
+- [x] Keep tmux lifecycle control manual and external to PaperScript. PaperScript may use
       tmux information for read-only status and doctor checks, but update must not send
       stop or start commands.
-- [ ] Keep full server, world, plugin, and BlueMap backup orchestration separate. A quick
+- [x] Keep full server, world, plugin, and BlueMap backup orchestration separate. A quick
       Paper jar download must not wait for hundreds of gigabytes of backup work. Limit
       PaperScript itself to safe jar retention and cleanup.
 
 Safe jar staging
 
-- [ ] Add a per-server exclusive lock so overlapping manual runs cannot share, remove,
+- [x] Add a per-server exclusive lock so overlapping manual runs cannot share, remove,
       or overwrite each other's staged downloads or state.
 - [ ] Make staging transactional: preflight disk space and permissions, download to a
       unique temporary file, require the Paper API SHA-256, verify size and jar structure,
       fsync, then atomically rename to Paper-<version>-<build>.jar.
-- [ ] Write config, state, and metadata cache atomically with temp files, fsync, and
-      os.replace; preserve and report corrupt JSON instead of silently replacing it.
-- [ ] Validate and contain every configured path. Reject filesystem roots, traversal,
+- [x] Write config and state atomically with temp files, fsync, and os.replace; preserve
+      and report corrupt JSON instead of silently replacing it.
+- [ ] Write metadata cache atomically and preserve a corrupt cache for diagnosis.
+- [x] Validate and contain every configured path. Reject filesystem roots, traversal,
       unsafe symlinks, and jar filename patterns that are not plain .jar basenames.
-- [ ] Namespace runtime state and locks by canonical server directory so one PaperScript
+- [x] Namespace runtime state and locks by canonical server directory so one PaperScript
       checkout can safely target more than one server.
 
 1MB-minecraft.sh integration
@@ -127,9 +144,24 @@ Safe jar staging
       lexicographic build ordering.
 - [x] Add launcher tests for multiple builds, multiple Minecraft versions, legacy fallback,
       malformed names, and build-number boundaries such as 9 versus 10.
+- [x] Record the exact launcher-selected basename atomically before Java starts, resolve
+      the launcher's own directory, ignore symlink jar candidates, hold a fail-closed
+      launch lock for the JVM lifetime, and restore the prior marker on JVM failure.
 - [ ] Manually review and apply the test-instance launcher diff at its canonical source,
       then propagate it through the normal 1MB-minecraft.sh release/update flow rather than
       editing every generated server copy.
+
+Bounded Paper jar retention
+
+- [x] Keep the valid last-launched jar plus the newest staged same-version jar in the
+      server root by default; temporarily protect one in-flight launcher rollback jar;
+      never infer or move an active jar without a valid marker.
+- [x] Archive only exact regular non-symlink Paper-<version>-<numeric-build>.jar files for
+      the marker version under paperscript/backups/jars/<version>/ and cap that archive.
+- [x] Add explicit cleanup --server-jars with confirmation, --keep, --version, and dry-run;
+      keep it out of cleanup --all and preserve the old cleanup --keep backup behavior.
+- [x] Add adversarial tests for numeric ordering, versions, malformed names, symlinks,
+      invalid markers, archive caps, lock contention, and active-jar byte/inode stability.
 
 Validation and operator feedback
 
@@ -158,15 +190,13 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "tmux_session": "mcserver",
     "default_channel": "STABLE",
     "check_latest_channel_only": "STABLE",
-    "allow_cross_version_auto_upgrade": False,
     "allow_same_version_build_upgrade": True,
     "keep_backups": 10,
-    "cleanup_backups_after_install": True,
-    "running_server_action": "ask",
-    "graceful_stop_command": "stop",
+    "keep_server_jars": 2,
+    "keep_archived_jars": 5,
+    "reconcile_server_jars_after_stage": True,
     "http_timeout_seconds": 30,
     "status_show_all_channels": True,
-    "download_filename_pattern": "Paper-{version}-{build}.jar",
     "log_file": "logs.log",
     "backup_dir": "backups",
     "downloads_dir": "downloads",
@@ -188,6 +218,48 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "http_retry_backoff_seconds": 1.5,
     "list_versions_channel_delay_ms": 150,
     "list_versions_continue_on_error": True,
+}
+BOOLEAN_CONFIG_KEYS = {
+    "allow_same_version_build_upgrade",
+    "reconcile_server_jars_after_stage",
+    "status_show_all_channels",
+    "metadata_cache_enabled",
+    "confirm_before_force_download",
+    "confirm_before_downgrade",
+    "auto_detect_server_by_port",
+    "fallback_process_detection",
+    "quiet",
+    "no_color",
+    "debug_http",
+    "list_versions_continue_on_error",
+}
+INTEGER_CONFIG_MINIMUMS = {
+    "keep_backups": 0,
+    "keep_server_jars": 2,
+    "keep_archived_jars": 1,
+    "http_timeout_seconds": 1,
+    "metadata_cache_ttl_seconds": 0,
+    "http_retries": 0,
+    "list_versions_channel_delay_ms": 0,
+}
+NUMBER_CONFIG_MINIMUMS = {
+    "http_retry_backoff_seconds": 0.0,
+}
+STRING_CONFIG_KEYS = {
+    "tmux_session",
+    "log_file",
+    "backup_dir",
+    "downloads_dir",
+    "metadata_cache_dir",
+}
+OPTIONAL_STRING_CONFIG_KEYS = {"server_name", "contact", "user_agent"}
+CONFIG_CHOICES = {
+    "default_channel": {"ALPHA", "BETA", "STABLE", "RECOMMENDED"},
+    "check_latest_channel_only": {"ALPHA", "BETA", "STABLE", "RECOMMENDED"},
+    "color_theme": set(COLOR_THEMES),
+    "default_status_view": {"full", "compact"},
+    "command_hint_mode": {"auto", "always", "never"},
+    "release_link_mode": {"auto", "always", "never"},
 }
 
 
@@ -234,6 +306,54 @@ class DownloadVerification:
     sha256: str
     bytes_written: int
     elapsed_seconds: float
+
+
+@dataclass(frozen=True)
+class JarRetentionPlan:
+    version: str
+    last_launched: Path
+    kept: tuple[Path, ...]
+    to_archive: tuple[Path, ...]
+    to_prune: tuple[Path, ...] = ()
+    launch_rollback: Path | None = None
+
+
+@dataclass(frozen=True)
+class LauncherJarSelection:
+    path: Path
+    version: str
+    build: int | None
+
+    @property
+    def is_numeric_build(self) -> bool:
+        return self.build is not None
+
+
+class ServerMutationLock:
+    """Non-blocking advisory lock for one server root."""
+
+    def __init__(self, path: Path) -> None:
+        self.path = path
+        self.handle: TextIO | None = None
+
+    def __enter__(self) -> "ServerMutationLock":
+        ensure_directory(self.path.parent)
+        self.handle = self.path.open("a+", encoding="utf-8")
+        try:
+            fcntl.flock(self.handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as error:
+            self.handle.close()
+            self.handle = None
+            raise PaperScriptError(
+                f"Another PaperScript staging or server-jar cleanup is already running for this server ({self.path})."
+            ) from error
+        return self
+
+    def __exit__(self, exc_type: Any, exc_value: Any, traceback: Any) -> None:
+        if self.handle is not None:
+            fcntl.flock(self.handle.fileno(), fcntl.LOCK_UN)
+            self.handle.close()
+            self.handle = None
 
 
 def utc_now() -> str:
@@ -379,6 +499,60 @@ def ensure_directory(path: Path) -> None:
     path.mkdir(parents=True, exist_ok=True)
 
 
+def path_is_within(path: Path, parent: Path) -> bool:
+    try:
+        path.resolve(strict=False).relative_to(parent.resolve(strict=False))
+        return True
+    except ValueError:
+        return False
+
+
+def paths_overlap(left: Path, right: Path) -> bool:
+    return path_is_within(left, right) or path_is_within(right, left)
+
+
+def fsync_directory(path: Path, *, strict: bool = False) -> None:
+    """Persist a directory entry update where the platform supports it."""
+    try:
+        descriptor = os.open(path, os.O_RDONLY)
+    except OSError as error:
+        if strict:
+            raise PaperScriptError(f"Could not open directory for durable sync {path}: {error}") from error
+        return
+    try:
+        os.fsync(descriptor)
+    except OSError as error:
+        if strict:
+            raise PaperScriptError(f"Could not durably sync directory {path}: {error}") from error
+    finally:
+        os.close(descriptor)
+
+
+def atomic_write_text(path: Path, content: str, mode: int = 0o600) -> None:
+    """Write a small runtime file without exposing a partial/truncated value."""
+    ensure_directory(path.parent)
+    descriptor, temporary_name = tempfile.mkstemp(
+        dir=path.parent,
+        prefix=f".{path.name}.",
+        suffix=".tmp",
+    )
+    temporary_path = Path(temporary_name)
+    try:
+        os.fchmod(descriptor, mode)
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            descriptor = -1
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary_path, path)
+        fsync_directory(path.parent)
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        if temporary_path.exists():
+            temporary_path.unlink()
+
+
 def run_command(args: list[str]) -> subprocess.CompletedProcess[str]:
     try:
         return subprocess.run(
@@ -458,11 +632,10 @@ class Logger:
             return color_text(message, theme["error"], True, bold=True)
         if (
             lower.startswith("downloaded to")
-            or lower.startswith("installed ")
+            or lower.startswith("staged:")
+            or lower.startswith("archived old server-root jar:")
             or lower.startswith("backed up ")
             or lower.startswith("cleanup finished:")
-            or lower.startswith("server stopped")
-            or lower.startswith("server force-stopped")
         ):
             return color_text(message, theme["success"], True, bold=True)
         if "checksum verification: match" in lower:
@@ -796,6 +969,22 @@ class PaperAPI:
                     time.sleep(wait_seconds)
                     continue
                 raise PaperScriptError(f"Download failed: {error.reason}") from error
+            except (OSError, http.client.IncompleteRead) as error:
+                if destination.exists():
+                    destination.unlink()
+                transient = isinstance(
+                    error,
+                    (TimeoutError, ConnectionError, http.client.IncompleteRead),
+                )
+                if transient and attempt < self.retries:
+                    wait_seconds = self.retry_backoff_seconds * (2 ** attempt)
+                    self._log_http(
+                        f"Transient download I/O error for {build.download_url}: {error}. "
+                        f"Retrying in {wait_seconds:.1f}s..."
+                    )
+                    time.sleep(wait_seconds)
+                    continue
+                raise PaperScriptError(f"Download I/O failed for {build.filename}: {error}") from error
 
         if build.sha256:
             digest = sha256.hexdigest()
@@ -892,25 +1081,52 @@ class PaperScriptApp:
     def __init__(self, args: argparse.Namespace) -> None:
         self.args = args
         self.script_dir = Path(__file__).resolve().parent
-        self.runtime_dir = self.script_dir
         self.server_dir = self._resolve_server_dir()
+        self.server_runtime_dir = self.server_dir / "paperscript"
+        self.runtime_dir = self.server_runtime_dir
+        self.last_launched_jar_marker_path = (
+            self.server_runtime_dir / LAST_LAUNCHED_JAR_MARKER
+        )
+        self.jar_archive_dir = self.server_runtime_dir / "backups" / "jars"
+        self.server_lock_path = self.server_runtime_dir / "locks" / "paper-jars.lock"
         self.config_path = self.runtime_dir / "config.json"
         self.state_path = self.runtime_dir / "state.json"
         self.todo_path = self.runtime_dir / "todo.log"
+        legacy_runtime_names = ("config.json", "state.json")
+        self.legacy_runtime_files = [
+            self.script_dir / name
+            for name in legacy_runtime_names
+            if self.runtime_dir != self.script_dir
+            and (self.script_dir / name).is_file()
+            and not (self.runtime_dir / name).exists()
+        ]
+        self.validate_server_runtime_path(self.runtime_dir)
+        if self.runtime_dir.exists() and not self.runtime_dir.is_dir():
+            raise PaperScriptError(
+                f"PaperScript runtime path must be a directory, not {self.runtime_dir}."
+            )
         self.config = self._load_config()
         self.quiet_mode = bool(args.quiet or self.config.get("quiet"))
         self.no_color = bool(args.no_color or self.config.get("no_color"))
         self.color_theme_name = normalize_choice(self.config.get("color_theme"), set(COLOR_THEMES), "default")
-        self.backups_dir = self.runtime_dir / str(self.config["backup_dir"])
-        self.downloads_dir = self.runtime_dir / str(self.config["downloads_dir"])
-        self.metadata_cache_dir = self.runtime_dir / str(self.config["metadata_cache_dir"])
-        self.log_path = self.runtime_dir / str(self.config["log_file"])
+        self.backups_dir = self.configured_runtime_path("backup_dir")
+        self.downloads_dir = self.configured_runtime_path("downloads_dir")
+        self.metadata_cache_dir = self.configured_runtime_path("metadata_cache_dir")
+        self.log_path = self.configured_runtime_path("log_file")
+        self.validate_runtime_layout()
         self.logger = Logger(
             self.log_path,
             quiet=self.quiet_mode,
             use_color=supports_color(sys.stdout, no_color=self.no_color),
             theme_name=self.color_theme_name,
         )
+        if self.legacy_runtime_files:
+            legacy_paths = ", ".join(str(path) for path in self.legacy_runtime_files)
+            self.logger.warn(
+                f"Legacy central-checkout runtime file(s) were not reused for target {self.server_dir}: "
+                f"{legacy_paths}. Review them and manually copy any target-specific settings or state into "
+                f"{self.runtime_dir}; PaperScript created safe target-local defaults."
+            )
         ensure_directory(self.backups_dir)
         ensure_directory(self.downloads_dir)
         ensure_directory(self.metadata_cache_dir)
@@ -918,29 +1134,29 @@ class PaperScriptApp:
         self.server_name = self.config.get("server_name")
         self.default_channel = str(self.config["default_channel"]).upper()
         self.check_latest_channel_only = str(self.config["check_latest_channel_only"]).upper()
-        self.allow_cross_version_auto_upgrade = bool(self.config["allow_cross_version_auto_upgrade"])
-        self.allow_same_version_build_upgrade = bool(self.config["allow_same_version_build_upgrade"])
-        self.keep_backups = int(self.config["keep_backups"])
-        self.cleanup_backups_after_install = bool(self.config["cleanup_backups_after_install"])
-        self.running_server_action = str(self.config["running_server_action"])
-        self.graceful_stop_command = str(self.config["graceful_stop_command"])
-        self.status_show_all_channels = bool(self.config["status_show_all_channels"])
-        self.download_filename_pattern = str(self.config["download_filename_pattern"])
-        self.confirm_before_force_download = bool(self.config["confirm_before_force_download"])
-        self.confirm_before_downgrade = bool(self.config["confirm_before_downgrade"])
-        self.auto_detect_server_by_port = bool(self.config["auto_detect_server_by_port"])
-        self.fallback_process_detection = bool(self.config["fallback_process_detection"])
+        self.allow_same_version_build_upgrade = self.config["allow_same_version_build_upgrade"]
+        self.keep_backups = self.config["keep_backups"]
+        self.keep_server_jars = self.config["keep_server_jars"]
+        self.keep_archived_jars = self.config["keep_archived_jars"]
+        self.reconcile_server_jars_after_stage = self.config["reconcile_server_jars_after_stage"]
+        self.status_show_all_channels = self.config["status_show_all_channels"]
+        self.confirm_before_force_download = self.config["confirm_before_force_download"]
+        self.confirm_before_downgrade = self.config["confirm_before_downgrade"]
+        self.auto_detect_server_by_port = self.config["auto_detect_server_by_port"]
+        self.fallback_process_detection = self.config["fallback_process_detection"]
         self.default_status_view = normalize_choice(self.config.get("default_status_view"), {"full", "compact"}, "full")
         self.command_hint_mode = normalize_choice(self.config.get("command_hint_mode"), {"auto", "always", "never"}, "auto")
         self.release_link_mode = normalize_choice(self.config.get("release_link_mode"), {"auto", "always", "never"}, "auto")
         self.debug_http = bool(args.debug_http or self.config.get("debug_http"))
-        self.metadata_cache_enabled = bool(self.config.get("metadata_cache_enabled", True)) and not bool(args.no_metadata_cache)
-        self.metadata_cache_ttl_seconds = int(self.config.get("metadata_cache_ttl_seconds", 300))
-        self.http_retries = int(self.config.get("http_retries", 2))
-        self.http_retry_backoff_seconds = float(self.config.get("http_retry_backoff_seconds", 1.5))
-        self.list_versions_channel_delay_ms = int(self.config.get("list_versions_channel_delay_ms", 150))
-        self.list_versions_continue_on_error = bool(self.config.get("list_versions_continue_on_error", True))
-        self.http_timeout = int(args.timeout) if args.timeout is not None else int(self.config["http_timeout_seconds"])
+        self.metadata_cache_enabled = self.config["metadata_cache_enabled"] and not bool(args.no_metadata_cache)
+        self.metadata_cache_ttl_seconds = self.config["metadata_cache_ttl_seconds"]
+        self.http_retries = self.config["http_retries"]
+        self.http_retry_backoff_seconds = float(self.config["http_retry_backoff_seconds"])
+        self.list_versions_channel_delay_ms = self.config["list_versions_channel_delay_ms"]
+        self.list_versions_continue_on_error = self.config["list_versions_continue_on_error"]
+        self.http_timeout = int(args.timeout) if args.timeout is not None else self.config["http_timeout_seconds"]
+        if self.http_timeout < 1:
+            raise PaperScriptError("--timeout must be at least 1 second.")
         self.user_agent = self._resolve_user_agent()
         self.api = PaperAPI(
             self.user_agent,
@@ -970,7 +1186,7 @@ class PaperScriptApp:
         return sum(1 for path in self.metadata_cache_dir.iterdir() if path.is_file())
 
     def force_example_for_current(self, current: JarInfo | None) -> str | None:
-        if current is None:
+        if current is None or current.build < 0:
             return None
         return f"./paperscript.sh --force download --version {current.version} --build {current.build}"
 
@@ -1017,28 +1233,266 @@ class PaperScriptApp:
 
     def _resolve_server_dir(self) -> Path:
         if self.args.server_dir:
-            return Path(self.args.server_dir).expanduser().resolve()
-        cwd = Path.cwd().resolve()
-        if cwd == self.script_dir and self.script_dir.name.lower() == APP_NAME.lower():
-            return self.script_dir.parent.resolve()
-        return cwd
+            resolved = Path(self.args.server_dir).expanduser().resolve()
+        else:
+            cwd = Path.cwd().resolve()
+            resolved = (
+                self.script_dir.parent.resolve()
+                if cwd == self.script_dir and self.script_dir.name.lower() == APP_NAME.lower()
+                else cwd
+            )
+        if resolved == Path(resolved.anchor):
+            raise PaperScriptError("Refusing to use a filesystem root as the server directory.")
+        return resolved
+
+    def configured_runtime_path(self, key: str) -> Path:
+        raw_path = Path(str(self.config[key]))
+        if raw_path.is_absolute():
+            raise PaperScriptError(
+                f"Config key {key!r} must be relative to {self.runtime_dir}; absolute paths are refused."
+            )
+        if ".." in raw_path.parts:
+            raise PaperScriptError(
+                f"Config key {key!r} contains parent traversal; PaperScript runtime paths must stay local."
+            )
+        candidate = self.runtime_dir / raw_path
+        self.validate_server_runtime_path(candidate)
+        if candidate.resolve(strict=False) == self.runtime_dir.resolve(strict=False):
+            raise PaperScriptError(
+                f"Config key {key!r} cannot target the PaperScript runtime directory itself."
+            )
+        parent = candidate.parent
+        while parent != self.runtime_dir:
+            if parent.exists() and not parent.is_dir():
+                raise PaperScriptError(
+                    f"Config key {key!r} has a non-directory path component: {parent}."
+                )
+            parent = parent.parent
+        return candidate
+
+    def validate_runtime_layout(self) -> None:
+        """Keep cleanup, archive, lock, state, and log roles from aliasing each other."""
+        self.validate_server_runtime_path(self.jar_archive_dir)
+        self.validate_server_runtime_path(self.server_lock_path)
+        self.validate_server_runtime_path(self.last_launched_jar_marker_path)
+
+        directory_roles = {
+            "backup_dir": self.backups_dir,
+            "downloads_dir": self.downloads_dir,
+            "metadata_cache_dir": self.metadata_cache_dir,
+        }
+        directory_items = list(directory_roles.items())
+        for index, (left_name, left_path) in enumerate(directory_items):
+            if left_path.exists() and not left_path.is_dir():
+                raise PaperScriptError(
+                    f"Config key {left_name!r} must identify a directory, not {left_path}."
+                )
+            for right_name, right_path in directory_items[index + 1 :]:
+                if paths_overlap(left_path, right_path):
+                    raise PaperScriptError(
+                        f"Config paths {left_name!r} and {right_name!r} overlap; cleanup roles must be disjoint."
+                    )
+
+        if paths_overlap(self.backups_dir, self.jar_archive_dir):
+            if self.backups_dir.resolve(strict=False) != self.jar_archive_dir.parent.resolve(strict=False):
+                raise PaperScriptError(
+                    "backup_dir may contain the managed JAR archive only as its direct backups/jars child."
+                )
+        for key in ("downloads_dir", "metadata_cache_dir"):
+            if paths_overlap(directory_roles[key], self.jar_archive_dir):
+                raise PaperScriptError(
+                    f"Config key {key!r} cannot overlap the managed JAR archive {self.jar_archive_dir}."
+                )
+
+        lock_dir = self.server_lock_path.parent
+        for key, directory in directory_items:
+            if paths_overlap(directory, lock_dir):
+                raise PaperScriptError(
+                    f"Config key {key!r} cannot overlap the reserved lock directory {lock_dir}."
+                )
+
+        reserved_files = {
+            self.config_path,
+            self.state_path,
+            self.todo_path,
+            self.last_launched_jar_marker_path,
+            self.server_runtime_dir / LAUNCHER_MARKER_ROLLBACK,
+            self.server_lock_path,
+        }
+        for key, directory in directory_items:
+            if any(path_is_within(reserved, directory) for reserved in reserved_files):
+                raise PaperScriptError(
+                    f"Config key {key!r} contains a reserved PaperScript runtime file."
+                )
+
+        if self.log_path.exists() and not self.log_path.is_file():
+            raise PaperScriptError(f"Config key 'log_file' must identify a regular file, not {self.log_path}.")
+        if self.log_path in reserved_files:
+            raise PaperScriptError("Config key 'log_file' aliases a reserved PaperScript runtime file.")
+        reserved_directories = [
+            self.jar_archive_dir,
+            lock_dir,
+            *directory_roles.values(),
+        ]
+        if any(paths_overlap(self.log_path, directory) for directory in reserved_directories):
+            raise PaperScriptError(
+                "Config key 'log_file' must not be inside a cleanup, archive, or lock directory."
+            )
 
     def _load_json(self, path: Path) -> dict[str, Any]:
         if not path.exists():
             return {}
         try:
             payload = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            return {}
-        return payload if isinstance(payload, dict) else {}
+        except OSError as error:
+            raise PaperScriptError(f"Could not read JSON file {path}: {error}") from error
+        except json.JSONDecodeError as error:
+            raise PaperScriptError(
+                f"JSON file {path} is malformed at line {error.lineno}, column {error.colno}; "
+                "PaperScript left it unchanged."
+            ) from error
+        if not isinstance(payload, dict):
+            raise PaperScriptError(f"JSON file {path} must contain an object; PaperScript left it unchanged.")
+        return payload
 
     def _save_json(self, path: Path, payload: dict[str, Any]) -> None:
-        path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        atomic_write_text(path, json.dumps(payload, indent=2, sort_keys=True) + "\n")
+
+    def _validate_config(self, config: dict[str, Any]) -> None:
+        for key in sorted(BOOLEAN_CONFIG_KEYS):
+            if type(config.get(key)) is not bool:
+                raise PaperScriptError(
+                    f"Config key {key!r} must be true or false; PaperScript left config.json unchanged."
+                )
+        for key, minimum in INTEGER_CONFIG_MINIMUMS.items():
+            value = config.get(key)
+            if type(value) is not int or value < minimum:
+                raise PaperScriptError(
+                    f"Config key {key!r} must be an integer of at least {minimum}; "
+                    "PaperScript left config.json unchanged."
+                )
+        for key, minimum in NUMBER_CONFIG_MINIMUMS.items():
+            value = config.get(key)
+            if (
+                type(value) not in {int, float}
+                or not math.isfinite(float(value))
+                or value < minimum
+            ):
+                raise PaperScriptError(
+                    f"Config key {key!r} must be a number of at least {minimum:g}; "
+                    "PaperScript left config.json unchanged."
+                )
+        for key in sorted(STRING_CONFIG_KEYS):
+            value = config.get(key)
+            if not isinstance(value, str) or not value.strip():
+                raise PaperScriptError(
+                    f"Config key {key!r} must be a non-empty string; PaperScript left config.json unchanged."
+                )
+        for key in {"log_file", "backup_dir", "downloads_dir", "metadata_cache_dir"}:
+            configured_path = Path(str(config[key]))
+            if configured_path.is_absolute() or ".." in configured_path.parts:
+                raise PaperScriptError(
+                    f"Config key {key!r} must be a relative path without parent traversal; "
+                    "PaperScript left config.json unchanged."
+                )
+        validation_root = Path("/__paperscript_runtime_layout__")
+        validation_archive = validation_root / "backups" / "jars"
+        validation_lock_dir = validation_root / "locks"
+        validation_directories = {
+            "backup_dir": validation_root / str(config["backup_dir"]),
+            "downloads_dir": validation_root / str(config["downloads_dir"]),
+            "metadata_cache_dir": validation_root / str(config["metadata_cache_dir"]),
+        }
+        validation_items = list(validation_directories.items())
+        for index, (left_name, left_path) in enumerate(validation_items):
+            for right_name, right_path in validation_items[index + 1 :]:
+                if paths_overlap(left_path, right_path):
+                    raise PaperScriptError(
+                        f"Config paths {left_name!r} and {right_name!r} overlap; "
+                        "PaperScript left config.json unchanged."
+                    )
+        validation_backup = validation_directories["backup_dir"]
+        if paths_overlap(validation_backup, validation_archive):
+            if validation_backup != validation_archive.parent:
+                raise PaperScriptError(
+                    "Config key 'backup_dir' conflicts with the managed JAR archive; "
+                    "PaperScript left config.json unchanged."
+                )
+        for key in ("downloads_dir", "metadata_cache_dir"):
+            if paths_overlap(validation_directories[key], validation_archive):
+                raise PaperScriptError(
+                    f"Config key {key!r} conflicts with the managed JAR archive; "
+                    "PaperScript left config.json unchanged."
+                )
+        for key, directory in validation_items:
+            if paths_overlap(directory, validation_lock_dir):
+                raise PaperScriptError(
+                    f"Config key {key!r} conflicts with the reserved lock directory; "
+                    "PaperScript left config.json unchanged."
+                )
+        validation_log = validation_root / str(config["log_file"])
+        validation_reserved_files = {
+            validation_root / "config.json",
+            validation_root / "state.json",
+            validation_root / "todo.log",
+            validation_root / LAST_LAUNCHED_JAR_MARKER,
+            validation_root / LAUNCHER_MARKER_ROLLBACK,
+            validation_lock_dir / "paper-jars.lock",
+        }
+        for key, directory in validation_items:
+            if any(
+                path_is_within(reserved, directory)
+                for reserved in validation_reserved_files
+            ):
+                raise PaperScriptError(
+                    f"Config key {key!r} contains a reserved runtime file; "
+                    "PaperScript left config.json unchanged."
+                )
+        if validation_log in validation_reserved_files or any(
+            paths_overlap(validation_log, directory)
+            for directory in [validation_archive, validation_lock_dir, *validation_directories.values()]
+        ):
+            raise PaperScriptError(
+                "Config key 'log_file' conflicts with a cleanup, archive, lock, or reserved-file role; "
+                "PaperScript left config.json unchanged."
+            )
+        for key in sorted(OPTIONAL_STRING_CONFIG_KEYS):
+            value = config.get(key)
+            if value is not None and not isinstance(value, str):
+                raise PaperScriptError(
+                    f"Config key {key!r} must be a string or null; PaperScript left config.json unchanged."
+                )
+        for key, choices in CONFIG_CHOICES.items():
+            value = config.get(key)
+            if not isinstance(value, str):
+                expected = ", ".join(sorted(choices))
+                raise PaperScriptError(
+                    f"Config key {key!r} must be one of {expected}; PaperScript left config.json unchanged."
+                )
+            normalized = value.upper() if key in {"default_channel", "check_latest_channel_only"} else value.lower()
+            normalized_choices = {
+                choice.upper() if key in {"default_channel", "check_latest_channel_only"} else choice.lower()
+                for choice in choices
+            }
+            if normalized not in normalized_choices:
+                expected = ", ".join(sorted(choices))
+                raise PaperScriptError(
+                    f"Config key {key!r} must be one of {expected}; PaperScript left config.json unchanged."
+                )
 
     def _load_config(self) -> dict[str, Any]:
         raw = self._load_json(self.config_path)
+        migrated = {key: value for key, value in raw.items() if key not in DEPRECATED_CONFIG_KEYS}
+        allowed_keys = set(DEFAULT_CONFIG) | OPTIONAL_STRING_CONFIG_KEYS
+        unknown_keys = sorted(set(migrated) - allowed_keys)
+        if unknown_keys:
+            rendered = ", ".join(repr(key) for key in unknown_keys)
+            raise PaperScriptError(
+                f"Unknown config key(s): {rendered}. PaperScript left config.json unchanged."
+            )
         merged = dict(DEFAULT_CONFIG)
-        merged.update(raw)
+        merged.update(migrated)
+        self._validate_config(merged)
         if raw != merged:
             self._save_json(self.config_path, merged)
         return merged
@@ -1065,29 +1519,56 @@ class PaperScriptApp:
 
         return DEFAULT_USER_AGENT
 
-    def record_state(self, build: BuildInfo, installed_path: Path, current_sha256: str) -> None:
+    def record_state(self, build: BuildInfo, staged_path: Path, current_sha256: str) -> None:
         self.state.update(
             {
-                "current_build": build.build_id,
-                "current_channel": build.channel,
-                "current_jar": installed_path.name,
-                "current_version": build.version,
-                "installed_at": utc_now(),
+                "staged_build": build.build_id,
+                "staged_channel": build.channel,
+                "staged_jar": staged_path.name,
+                "staged_version": build.version,
+                "staged_at": utc_now(),
+                "staged_sha256": current_sha256,
                 "server_dir": str(self.server_dir),
                 "expected_sha256": build.sha256,
-                "current_sha256": current_sha256,
                 "download_url": build.download_url,
             }
         )
         self._save_json(self.state_path, self.state)
 
+    def recorded_staged_jar(self, version: str) -> Path | None:
+        state_name = self.state.get("staged_jar")
+        state_version = self.state.get("staged_version")
+        state_server_dir = self.state.get("server_dir")
+        if not state_name or not state_version:
+            return None
+        if str(state_version).casefold() != version.casefold():
+            return None
+        if state_server_dir:
+            try:
+                if Path(str(state_server_dir)).resolve() != self.server_dir.resolve():
+                    return None
+            except OSError:
+                return None
+        path = self.server_dir / str(state_name)
+        if self.strict_managed_jar_info(path, version) is None:
+            return None
+        expected = self.state.get("staged_sha256") or self.state.get("expected_sha256")
+        if expected and re.fullmatch(r"[0-9a-fA-F]{64}", str(expected)):
+            if sha256_file(path).lower() != str(expected).lower():
+                raise PaperScriptError(
+                    f"Recorded staged jar {path.name} no longer matches its recorded SHA-256; cleanup was refused."
+                )
+        return path
+
     def jar_info_from_state(self, path: Path) -> JarInfo | None:
-        state_name = self.state.get("current_jar")
+        state_name = self.state.get("staged_jar") or self.state.get("current_jar")
         if not state_name or path.name != str(state_name):
             return None
 
-        version = self.state.get("current_version")
-        build = self.state.get("current_build")
+        version = self.state.get("staged_version") or self.state.get("current_version")
+        build = self.state.get("staged_build")
+        if build is None:
+            build = self.state.get("current_build")
         if not version or build is None:
             return None
 
@@ -1105,27 +1586,443 @@ class PaperScriptApp:
         return self.jar_info_from_state(path)
 
     def find_current_jar(self) -> JarInfo | None:
-        state_name = self.state.get("current_jar")
-        if state_name:
-            state_path = self.server_dir / state_name
-            if state_path.exists():
-                state_jar = self.jar_info_from_filename(state_path)
-                if state_jar:
-                    return state_jar
-
         candidates: list[JarInfo] = []
         for path in self.server_dir.glob("*.jar"):
+            if path.is_symlink() or not path.is_file():
+                continue
             jar = self.jar_info_from_filename(path)
-            if jar:
+            if jar and CURRENT_JAR_PATTERN.fullmatch(path.name):
                 candidates.append(jar)
-        if not candidates:
-            return None
+        if candidates:
+            candidates.sort(
+                key=lambda item: (parse_version(item.version).key(), item.build),
+                reverse=True,
+            )
+            return candidates[0]
 
-        candidates.sort(
-            key=lambda item: (parse_version(item.version).key(), item.build),
-            reverse=True,
+        # Compatibility fallback for a legacy/custom non-numeric jar explicitly recorded in state.
+        state_name = self.state.get("staged_jar") or self.state.get("current_jar")
+        if state_name:
+            state_path = self.server_dir / str(state_name)
+            if state_path.parent == self.server_dir and not state_path.is_symlink() and state_path.is_file():
+                return self.jar_info_from_state(state_path)
+        return None
+
+    @contextmanager
+    def server_mutation_lock(self) -> Iterator[None]:
+        self.validate_server_runtime_path(self.server_lock_path)
+        with ServerMutationLock(self.server_lock_path):
+            yield
+
+    def validate_server_runtime_path(self, path: Path) -> None:
+        """Reject retention paths that escape the target server through traversal or symlinks."""
+        server_root = self.server_dir.resolve()
+        candidate = path.resolve(strict=False)
+        try:
+            candidate.relative_to(server_root)
+        except ValueError as error:
+            raise PaperScriptError(
+                f"Refusing to use a PaperScript server-runtime path outside {server_root}: {path}"
+            ) from error
+
+        current = path
+        while current != self.server_dir:
+            if current.is_symlink():
+                raise PaperScriptError(
+                    f"Refusing to use symlinked server-runtime path component: {current}"
+                )
+            parent = current.parent
+            if parent == current:
+                raise PaperScriptError(f"Could not contain server-runtime path {path} inside {server_root}.")
+            current = parent
+
+    def strict_managed_jar_info(self, path: Path, version: str | None = None) -> JarInfo | None:
+        """Return canonical numeric Paper metadata without following symlinks."""
+        if path.parent != self.server_dir or path.is_symlink():
+            return None
+        try:
+            metadata = path.lstat()
+        except OSError:
+            return None
+        if not stat.S_ISREG(metadata.st_mode):
+            return None
+        match = CURRENT_JAR_PATTERN.fullmatch(path.name)
+        if not match:
+            return None
+        parsed_version = match.group(1)
+        if not SAFE_VERSION_PATTERN.fullmatch(parsed_version):
+            return None
+        if version is not None and parsed_version.casefold() != version.casefold():
+            return None
+        return JarInfo(path=path, version=parsed_version, build=int(match.group(2)))
+
+    def managed_server_jars(self, version: str) -> list[JarInfo]:
+        if not SAFE_VERSION_PATTERN.fullmatch(version):
+            raise PaperScriptError(f"Unsafe Minecraft version for jar retention: {version!r}")
+        candidates: list[JarInfo] = []
+        try:
+            children = list(self.server_dir.iterdir())
+        except OSError as error:
+            raise PaperScriptError(f"Could not inspect server directory {self.server_dir}: {error}") from error
+        for path in children:
+            jar = self.strict_managed_jar_info(path, version)
+            if jar is not None:
+                candidates.append(jar)
+        candidates.sort(key=lambda item: (item.build, item.path.name.casefold(), item.path.name), reverse=True)
+        return candidates
+
+    def launcher_jar_selection(self) -> LauncherJarSelection:
+        """Read the launcher's exact selection without authorizing legacy jars for retention."""
+        marker = self.last_launched_jar_marker_path
+        self.validate_server_runtime_path(marker)
+        if marker.is_symlink() or not marker.is_file():
+            raise PaperScriptError(
+                f"No valid launcher marker exists at {marker}. "
+                "Start the server once with the updated 1MB-minecraft.sh, then retry."
+            )
+        try:
+            if marker.stat().st_size > 512:
+                raise PaperScriptError(f"Launcher marker is unexpectedly large: {marker}")
+            raw_name = marker.read_text(encoding="utf-8")
+        except (OSError, UnicodeError) as error:
+            raise PaperScriptError(f"Could not read launcher marker {marker}: {error}") from error
+        name = raw_name.strip()
+        if (
+            not name
+            or name != Path(name).name
+            or "/" in name
+            or "\\" in name
+            or len(raw_name.splitlines()) != 1
+        ):
+            raise PaperScriptError(f"Launcher marker does not contain one safe jar basename: {marker}")
+        path = self.server_dir / name
+        if path.is_symlink():
+            raise PaperScriptError(f"Launcher marker identifies a symlink, which is unsafe: {path}")
+        try:
+            metadata = path.lstat()
+        except OSError as error:
+            raise PaperScriptError(f"Launcher marker identifies a missing or unreadable jar: {path}") from error
+        if not stat.S_ISREG(metadata.st_mode):
+            raise PaperScriptError(f"Launcher marker does not identify a regular file: {path}")
+
+        numeric = self.strict_managed_jar_info(path)
+        if numeric is not None:
+            return LauncherJarSelection(numeric.path, numeric.version, numeric.build)
+
+        legacy_match = LEGACY_JAR_PATTERN.fullmatch(name)
+        if legacy_match and SAFE_VERSION_PATTERN.fullmatch(legacy_match.group(1)):
+            return LauncherJarSelection(path, legacy_match.group(1), None)
+        raise PaperScriptError(
+            f"Launcher marker {marker} does not identify an existing regular Paper jar with a safe version name."
         )
-        return candidates[0]
+
+    def last_launched_jar(self, version: str | None = None) -> JarInfo:
+        selection = self.launcher_jar_selection()
+        if version is not None and selection.version.casefold() != version.casefold():
+            expected = f"Paper-{version}-<build>.jar"
+            raise PaperScriptError(
+                f"Launcher marker {self.last_launched_jar_marker_path} does not identify {expected}. "
+                "Root jar retention was skipped."
+            )
+        if selection.build is None:
+            raise PaperScriptError(
+                f"Launcher marker identifies legacy jar {selection.path.name}. Root jar retention requires "
+                "a numeric Paper-<version>-<build>.jar marker and was skipped. Stage a numeric build, "
+                "then start it once with the updated 1MB-minecraft.sh."
+            )
+        return JarInfo(selection.path, selection.version, selection.build)
+
+    def inflight_launcher_rollback_jar(self, version: str) -> JarInfo | None:
+        """Protect the prior numeric JAR while the launcher may need to roll back its marker."""
+        launch_lock = self.server_runtime_dir / "locks" / "server-launch"
+        rollback_marker = self.server_runtime_dir / LAUNCHER_MARKER_ROLLBACK
+        self.validate_server_runtime_path(launch_lock)
+        self.validate_server_runtime_path(rollback_marker)
+        if not launch_lock.exists():
+            return None
+        if launch_lock.is_symlink() or not launch_lock.is_dir():
+            raise PaperScriptError(
+                f"Active launcher lock is unsafe; root JAR retention was refused: {launch_lock}"
+            )
+        if not rollback_marker.exists():
+            return None
+        if rollback_marker.is_symlink() or not rollback_marker.is_file():
+            raise PaperScriptError(
+                f"Active launcher rollback marker is unsafe; root JAR retention was refused: {rollback_marker}"
+            )
+        try:
+            if rollback_marker.stat().st_size > 512:
+                raise PaperScriptError(
+                    f"Active launcher rollback marker is unexpectedly large: {rollback_marker}"
+                )
+            raw_name = rollback_marker.read_text(encoding="utf-8")
+        except (OSError, UnicodeError) as error:
+            raise PaperScriptError(
+                f"Could not read active launcher rollback marker {rollback_marker}: {error}"
+            ) from error
+        name = raw_name.strip()
+        if not name:
+            return None
+        if (
+            name != Path(name).name
+            or "/" in name
+            or "\\" in name
+            or len(raw_name.splitlines()) != 1
+        ):
+            raise PaperScriptError(
+                f"Active launcher rollback marker does not contain one safe JAR basename: {rollback_marker}"
+            )
+        path = self.server_dir / name
+        managed = self.strict_managed_jar_info(path, version)
+        if managed is not None:
+            return managed
+
+        numeric = CURRENT_JAR_PATTERN.fullmatch(name)
+        if numeric and numeric.group(1).casefold() == version.casefold():
+            raise PaperScriptError(
+                f"Active launcher rollback JAR is missing or unsafe: {path}. Root JAR retention was refused."
+            )
+        return None
+
+    def plan_server_jar_retention(
+        self,
+        version: str,
+        keep: int | None = None,
+        staged_path: Path | None = None,
+    ) -> JarRetentionPlan:
+        keep_count = self.keep_server_jars if keep is None else int(keep)
+        if keep_count < 2:
+            raise PaperScriptError(
+                "Server-root jar retention must keep at least two slots: last launched plus newest staged."
+            )
+        last_launched = self.last_launched_jar(version)
+        candidates = self.managed_server_jars(version)
+        protected: list[Path] = [last_launched.path]
+        launch_rollback = self.inflight_launcher_rollback_jar(version)
+        if launch_rollback is not None and launch_rollback.path not in protected:
+            protected.append(launch_rollback.path)
+        staged: JarInfo | None = None
+        if staged_path is not None:
+            staged = self.strict_managed_jar_info(staged_path, version)
+            if staged is None:
+                raise PaperScriptError(f"Just-staged jar is no longer a safe regular file: {staged_path}")
+        if candidates and candidates[0].path not in protected:
+            protected.append(candidates[0].path)
+        if staged is not None and candidates and staged.path != candidates[0].path:
+            self.logger.log(
+                f"Recorded staged jar {staged.path.name} is not the greatest numeric build; "
+                f"the launcher will choose {candidates[0].path.name}, so only the actual next selection is protected."
+            )
+        for jar in candidates:
+            if (
+                keep_count > 2
+                and jar.path not in protected
+                and len(protected) < keep_count
+            ):
+                protected.append(jar.path)
+        protected_set = set(protected)
+        to_archive = tuple(jar.path for jar in candidates if jar.path not in protected_set)
+        to_prune = self.predict_managed_archive_prune(version, to_archive)
+        return JarRetentionPlan(
+            version=version,
+            last_launched=last_launched.path,
+            kept=tuple(protected),
+            to_archive=to_archive,
+            to_prune=to_prune,
+            launch_rollback=launch_rollback.path if launch_rollback is not None else None,
+        )
+
+    def archive_directory_for_version(self, version: str) -> Path:
+        if not SAFE_VERSION_PATTERN.fullmatch(version):
+            raise PaperScriptError(f"Unsafe Minecraft version for jar archive: {version!r}")
+        path = self.jar_archive_dir / version
+        self.validate_server_runtime_path(path)
+        return path
+
+    def fsync_archive_publish_chain(self, archive_dir: Path) -> None:
+        """Require every directory entry from the version archive through the server root to be durable."""
+        current = archive_dir
+        while True:
+            fsync_directory(current, strict=True)
+            if current == self.server_dir:
+                return
+            if current == current.parent:
+                raise PaperScriptError(
+                    f"Could not contain archive directory {archive_dir} under {self.server_dir}."
+                )
+            current = current.parent
+
+    def archive_server_jar(self, source: Path, version: str) -> Path:
+        jar = self.strict_managed_jar_info(source, version)
+        if jar is None:
+            raise PaperScriptError(f"Refusing to archive a changed or unmanaged jar: {source}")
+        archive_dir = self.archive_directory_for_version(version)
+        ensure_directory(archive_dir)
+        self.validate_server_runtime_path(archive_dir)
+        destination = archive_dir / source.name
+
+        if destination.is_symlink() or (destination.exists() and not destination.is_file()):
+            raise PaperScriptError(f"Refusing to overwrite non-file jar archive destination: {destination}")
+        if destination.exists():
+            before = source.lstat()
+            source_sha = sha256_file(source)
+            after = source.lstat()
+            if (
+                source.is_symlink()
+                or (before.st_dev, before.st_ino, before.st_size)
+                != (after.st_dev, after.st_ino, after.st_size)
+            ):
+                raise PaperScriptError(
+                    f"Jar changed while an archive collision was checked; left both paths unchanged: {source}"
+                )
+            if sha256_file(destination) != source_sha:
+                raise PaperScriptError(
+                    f"Jar archive collision has different content; left both paths unchanged: {destination}"
+                )
+            self.fsync_archive_publish_chain(archive_dir)
+            source.unlink()
+            fsync_directory(self.server_dir)
+            self.logger.log(f"Removed duplicate root jar already present in the archive: {source.name}")
+            return destination
+
+        before = source.lstat()
+        descriptor, temporary_name = tempfile.mkstemp(
+            dir=archive_dir,
+            prefix=f".{source.name}.",
+            suffix=".part",
+        )
+        temporary = Path(temporary_name)
+        try:
+            digest = hashlib.sha256()
+            with source.open("rb") as input_handle, os.fdopen(descriptor, "wb") as output_handle:
+                descriptor = -1
+                while True:
+                    chunk = input_handle.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    digest.update(chunk)
+                    output_handle.write(chunk)
+                output_handle.flush()
+                os.fsync(output_handle.fileno())
+            after = source.lstat()
+            if (
+                source.is_symlink()
+                or (before.st_dev, before.st_ino, before.st_size)
+                != (after.st_dev, after.st_ino, after.st_size)
+                or digest.hexdigest() != sha256_file(temporary)
+            ):
+                raise PaperScriptError(f"Jar changed while it was being archived; left the root copy in place: {source}")
+            try:
+                os.link(temporary, destination)
+            except FileExistsError as error:
+                raise PaperScriptError(f"Jar archive destination appeared during cleanup: {destination}") from error
+            temporary.unlink()
+            self.fsync_archive_publish_chain(archive_dir)
+            source.unlink()
+            fsync_directory(self.server_dir)
+            self.logger.log(f"Archived old server-root jar: {source.name} -> {destination}")
+            return destination
+        finally:
+            if descriptor >= 0:
+                os.close(descriptor)
+            if temporary.exists():
+                temporary.unlink()
+
+    def predict_managed_archive_prune(
+        self,
+        version: str,
+        incoming: tuple[Path, ...] = (),
+    ) -> tuple[Path, ...]:
+        archive_dir = self.archive_directory_for_version(version)
+        archived: list[JarInfo] = []
+        if archive_dir.exists():
+            for path in archive_dir.iterdir():
+                if path.is_symlink():
+                    continue
+                try:
+                    metadata = path.lstat()
+                except OSError:
+                    continue
+                if not stat.S_ISREG(metadata.st_mode):
+                    continue
+                match = CURRENT_JAR_PATTERN.fullmatch(path.name)
+                if not match or match.group(1).casefold() != version.casefold():
+                    continue
+                archived.append(JarInfo(path, match.group(1), int(match.group(2))))
+        known_paths = {item.path for item in archived}
+        for source in incoming:
+            match = CURRENT_JAR_PATTERN.fullmatch(source.name)
+            if not match or match.group(1).casefold() != version.casefold():
+                raise PaperScriptError(f"Cannot predict archive retention for unmanaged jar: {source}")
+            destination = archive_dir / source.name
+            if destination in known_paths or destination.exists():
+                continue
+            archived.append(JarInfo(destination, match.group(1), int(match.group(2))))
+            known_paths.add(destination)
+        archived.sort(key=lambda item: (item.build, item.path.name.casefold(), item.path.name), reverse=True)
+        return tuple(jar.path for jar in archived[self.keep_archived_jars :])
+
+    def prune_managed_jar_archive(
+        self,
+        version: str,
+        expected: tuple[Path, ...] | None = None,
+    ) -> int:
+        archive_dir = self.archive_directory_for_version(version)
+        to_prune = self.predict_managed_archive_prune(version)
+        if expected is not None and to_prune != expected:
+            raise PaperScriptError(
+                "Managed JAR archive contents changed after retention was planned; no archive files were pruned."
+            )
+        removed = 0
+        for path in to_prune:
+            if path.is_symlink() or not path.is_file():
+                raise PaperScriptError(f"Refusing to prune a changed managed JAR archive path: {path}")
+            match = CURRENT_JAR_PATTERN.fullmatch(path.name)
+            if not match or match.group(1).casefold() != version.casefold():
+                raise PaperScriptError(f"Refusing to prune an unmanaged JAR archive path: {path}")
+            path.unlink()
+            removed += 1
+            self.logger.log(f"Pruned archived Paper jar: {path}")
+        if removed:
+            fsync_directory(archive_dir)
+        return removed
+
+    def managed_jar_archive_count(self, version: str) -> int:
+        archive_dir = self.archive_directory_for_version(version)
+        if not archive_dir.exists():
+            return 0
+        count = 0
+        for path in archive_dir.iterdir():
+            match = CURRENT_JAR_PATTERN.fullmatch(path.name)
+            if (
+                not path.is_symlink()
+                and path.is_file()
+                and match
+                and match.group(1).casefold() == version.casefold()
+            ):
+                count += 1
+        return count
+
+    def apply_server_jar_retention(self, plan: JarRetentionPlan, dry_run: bool = False) -> int:
+        current_marker = self.last_launched_jar(plan.version)
+        if current_marker.path != plan.last_launched:
+            raise PaperScriptError("The last-launched jar changed while retention was being planned; retry cleanup.")
+        if dry_run:
+            for source in plan.to_archive:
+                destination = self.archive_directory_for_version(plan.version) / source.name
+                self.logger.log(f"Dry run: would archive {source.name} to {destination}")
+            for path in plan.to_prune:
+                self.logger.log(
+                    f"Dry run: would permanently prune archived Paper jar beyond the configured cap: {path}"
+                )
+            return 0
+
+        archived = 0
+        for source in plan.to_archive:
+            self.archive_server_jar(source, plan.version)
+            archived += 1
+        self.prune_managed_jar_archive(plan.version, expected=plan.to_prune)
+        return archived
 
     def latest_stable_version(self) -> tuple[str, BuildInfo]:
         versions = [item["id"] for item in self.api.get_project_versions()]
@@ -1164,11 +2061,11 @@ class PaperScriptApp:
         self.logger.log(f"Server properties found: {'yes' if has_server_properties else 'no'}")
         if current_jar:
             self.logger.log(
-                f"Detected current jar: {current_jar.path.name} "
+                f"Detected newest managed jar: {current_jar.path.name} "
                 f"(version {current_jar.version}, build {current_jar.build})"
             )
         else:
-            self.logger.log("Detected current jar: none")
+            self.logger.log("Detected newest managed jar: none")
         self.log_command_hint(
             "For a stable overview, run './paperscript.sh stable'. For a preview overview, run './paperscript.sh experimental'."
         )
@@ -1271,10 +2168,10 @@ class PaperScriptApp:
                     default="stable" if "STABLE" in by_channel else None,
                     logger=self.logger,
                 )
-                self.install_build(
+                self.stage_build(
                     by_channel[selected.upper()],
                     force_version_prompt=True,
-                    prompt_for_force_reinstall=True,
+                    prompt_for_forced_recheck=True,
                 )
 
     def explore_versions(self) -> None:
@@ -1294,127 +2191,88 @@ class PaperScriptApp:
             self.console_only("Please enter one of the listed numbers.")
 
     def choose_target_for_update(self) -> BuildInfo | None:
-        current = self.find_current_jar()
-        latest_version, latest_build = self.latest_stable_version()
+        newest_managed = self.find_current_jar()
+        try:
+            current = self.last_launched_jar()
+            update_basis = "launcher-marked"
+        except PaperScriptError:
+            try:
+                launcher_selection = self.launcher_jar_selection()
+            except PaperScriptError:
+                current = newest_managed
+                update_basis = "newest managed (launcher marker unavailable)"
+            else:
+                same_family = self.managed_server_jars(launcher_selection.version)
+                state_jar = self.jar_info_from_state(launcher_selection.path)
+                current = (
+                    same_family[0]
+                    if same_family
+                    else state_jar
+                    if state_jar is not None
+                    else JarInfo(launcher_selection.path, launcher_selection.version, -1)
+                )
+                update_basis = "launcher-marked legacy family"
+        latest_overall_version, latest_overall_build = self.latest_stable_version()
 
         if current is None:
             self.logger.log(
-                f"No current Paper jar detected. Latest stable is version {latest_version} build #{latest_build.build_id}."
+                    f"No managed Paper jar detected. Latest stable is version {latest_overall_version} "
+                f"build #{latest_overall_build.build_id}."
+            )
+            return latest_overall_build
+
+        if current.version.casefold() == latest_overall_version.casefold():
+            latest_build = latest_overall_build
+        else:
+            latest_build = self.api.get_latest_build(
+                current.version,
+                channel=self.check_latest_channel_only,
+            )
+            if latest_build is None:
+                self.logger.log(
+                    f"No {self.check_latest_channel_only} build was found for the selected Minecraft version "
+                    f"{current.version}; no download was performed."
+                )
+                return None
+            if compare_versions(latest_overall_version, current.version) > 0:
+                self.logger.log(
+                    f"A newer Minecraft family ({latest_overall_version}) exists, but update only stages builds "
+                    f"for the {update_basis} version {current.version}. Use an explicit download --version "
+                    "command after reviewing launcher/plugin compatibility."
+                )
+
+        if latest_build.build_id > current.build:
+            if not self.allow_same_version_build_upgrade:
+                self.logger.log(
+                    "A newer build exists for the selected version, but same-version build upgrades are disabled in config."
+                )
+                return None
+            current_description = (
+                f"{current.version} build #{current.build}"
+                if current.build >= 0
+                else f"{current.version} with an unknown legacy build"
+            )
+            self.logger.log(
+                f"The {update_basis} server family is {current_description}. "
+                f"Latest stable build for that version is #{latest_build.build_id}."
             )
             return latest_build
-
-        version_cmp = compare_versions(current.version, latest_version)
-        if version_cmp == 0:
-            if latest_build.build_id > current.build:
-                if not self.allow_same_version_build_upgrade:
-                    self.logger.log(
-                        "A newer build exists for the current version, but same-version build upgrades are disabled in config."
-                    )
-                    return None
-                self.logger.log(
-                    f"Current server is on {current.version} build #{current.build}. "
-                    f"Latest stable build is #{latest_build.build_id}."
-                )
-                return latest_build
-            if latest_build.build_id == current.build and self.args.force:
-                self.logger.log(
-                    f"Current server is already on {current.version} build #{current.build}, "
-                    "but --force was supplied, so PaperScript will re-download and reinstall the latest stable build."
-                )
-                return latest_build
+        if latest_build.build_id == current.build and self.args.force:
             self.logger.log(
-                f"Current server is already on {current.version} build #{current.build}. "
-                "No newer stable build is available, so no download was performed."
+                f"The {update_basis} server family already has {current.version} build #{current.build}, "
+                "but --force was supplied, so PaperScript will re-check that build."
             )
-            self.logger.log("If you want to re-download this jar anyway, run one of these:")
-            self.logger.log("  ./paperscript.sh --force update")
-            exact_force = self.force_example_for_current(current)
-            if exact_force:
-                self.logger.log(f"  {exact_force}")
-            return None
-
-        if version_cmp > 0:
-            self.logger.log(
-                f"Current server version {current.version} is newer than the latest stable version "
-                f"this script found ({latest_version}). No download was performed automatically."
-            )
-            return None
-
+            return latest_build
         self.logger.log(
-            f"Current server is on version {current.version} build #{current.build}. "
-            f"Latest stable is {latest_version} build #{latest_build.build_id}."
+            f"The {update_basis} server family already has {current.version} build #{current.build}. "
+            "No newer stable build is available, so no download was performed."
         )
-        if self.allow_cross_version_auto_upgrade:
-            self.logger.log("Cross-version auto-upgrade is enabled in config, so PaperScript will continue.")
-            return latest_build
-        if self.args.dry_run:
-            self.logger.log(
-                f"Dry run: PaperScript would ask before upgrading from {current.version} to {latest_version}."
-            )
-            return latest_build
-        if self.args.yes or prompt_yes_no(
-            f"This is a version upgrade from {current.version} to {latest_version}. Download it?",
-            default=False,
-            logger=self.logger,
-        ):
-            return latest_build
-        self.logger.log("Skipped version upgrade by choice.")
-        self.logger.log("No download was performed.")
+        self.logger.log("If you want to re-check this jar anyway, run one of these:")
+        self.logger.log("  ./paperscript.sh --force update")
+        exact_force = self.force_example_for_current(current)
+        if exact_force:
+            self.logger.log(f"  {exact_force}")
         return None
-
-    def ensure_safe_to_upgrade(self) -> None:
-        if not (self.server_dir / "server.properties").exists():
-            return
-        processes = self.detect_running_server_processes()
-        if not processes:
-            return
-
-        self.logger.log("A Paper server process appears to be running in this server directory.")
-        for pid, command in processes:
-            self.logger.log(f"  - PID {pid}: {command}")
-
-        if self.args.dry_run:
-            action = self.planned_running_server_action()
-            self.logger.log(f"Dry run: PaperScript would handle the running server with action '{action}'.")
-            return
-
-        if self.args.yes:
-            self.logger.log("--yes was supplied, so PaperScript will try a graceful stop automatically.")
-            self.graceful_stop(processes)
-            return
-
-        configured_action = self.running_server_action
-        if configured_action == "graceful-stop":
-            self.graceful_stop(processes)
-            return
-        if configured_action == "force-stop":
-            self.force_stop(processes)
-            return
-        if configured_action == "upgrade-anyway":
-            self.logger.log("Config is set to continue even if the server appears to still be running.")
-            return
-
-        choice = prompt_choice(
-            "Choose how to continue:",
-            [
-                ("g", "Gracefully stop the server first"),
-                ("f", "Force stop the server"),
-                ("u", "Upgrade anyway without stopping"),
-                ("e", "Exit without changing anything"),
-            ],
-            default="e",
-            logger=self.logger,
-        )
-        if choice == "g":
-            self.graceful_stop(processes)
-            return
-        if choice == "f":
-            self.force_stop(processes)
-            return
-        if choice == "u":
-            self.logger.log("Proceeding even though the server appears to still be running.")
-            return
-        raise PaperScriptError("Stopped at user request.")
 
     def detect_running_server_processes(self) -> list[tuple[int, str]]:
         if self.auto_detect_server_by_port:
@@ -1484,13 +2342,6 @@ class PaperScriptApp:
             matches.append((current_pid, current_command or "java"))
         return matches
 
-    def planned_running_server_action(self) -> str:
-        if self.args.yes:
-            return "graceful-stop"
-        if self.running_server_action in {"ask", "graceful-stop", "force-stop", "upgrade-anyway"}:
-            return self.running_server_action
-        return "ask"
-
     def process_cwd(self, pid: int) -> str | None:
         result = run_command(["lsof", "-a", "-d", "cwd", "-p", str(pid), "-Fn"])
         if result.returncode != 0:
@@ -1500,147 +2351,114 @@ class PaperScriptApp:
                 return line[1:]
         return None
 
-    def graceful_stop(self, processes: list[tuple[int, str]]) -> None:
-        if self.try_tmux_stop():
-            if self.wait_for_exit([pid for pid, _ in processes], timeout_seconds=45):
-                self.logger.log("Server stopped after sending the tmux stop command.")
-                return
-            self.logger.log("The tmux stop command was sent, but the process is still running.")
-
-        for pid, _ in processes:
-            os.kill(pid, signal.SIGTERM)
-            self.logger.log(f"Sent SIGTERM to PID {pid}.")
-        if not self.wait_for_exit([pid for pid, _ in processes], timeout_seconds=20):
-            raise PaperScriptError("The server did not stop after a soft shutdown attempt.")
-        self.logger.log("Server stopped.")
-
-    def force_stop(self, processes: list[tuple[int, str]]) -> None:
-        for pid, _ in processes:
-            os.kill(pid, signal.SIGKILL)
-            self.logger.log(f"Sent SIGKILL to PID {pid}.")
-        if not self.wait_for_exit([pid for pid, _ in processes], timeout_seconds=10):
-            raise PaperScriptError("A server process still appears to be running after SIGKILL.")
-        self.logger.log("Server force-stopped.")
-
-    def wait_for_exit(self, pids: list[int], timeout_seconds: int) -> bool:
-        deadline = time.time() + timeout_seconds
-        remaining = set(pids)
-        while remaining and time.time() < deadline:
-            finished: list[int] = []
-            for pid in remaining:
-                try:
-                    os.kill(pid, 0)
-                except OSError:
-                    finished.append(pid)
-            for pid in finished:
-                remaining.discard(pid)
-            if remaining:
-                time.sleep(1)
-        return not remaining
-
-    def try_tmux_stop(self) -> bool:
-        session = self.tmux_session
-        has_session = run_command(["tmux", "has-session", "-t", session])
-        if has_session.returncode != 0:
-            self.logger.log(
-                f"tmux session '{session}' was not found, so PaperScript cannot send a graceful stop command there."
+    def stage_target_path(self, build: BuildInfo) -> Path:
+        if not SAFE_VERSION_PATTERN.fullmatch(build.version):
+            raise PaperScriptError(f"Unsafe Minecraft version for staging: {build.version!r}")
+        target_name = build.filename
+        match = CURRENT_JAR_PATTERN.fullmatch(target_name)
+        if (
+            not match
+            or match.group(1).casefold() != build.version.casefold()
+            or int(match.group(2)) != build.build_id
+        ):
+            raise PaperScriptError(
+                f"Safe staging target must be Paper-{build.version}-{build.build_id}.jar."
             )
-            return False
-
-        send = run_command(["tmux", "send-keys", "-t", session, self.graceful_stop_command, "Enter"])
-        if send.returncode != 0:
-            self.logger.log(
-                f"Sending '{self.graceful_stop_command}' to tmux session '{session}' failed: "
-                f"{send.stderr.strip() or 'unknown error'}"
-            )
-            return False
-
-        self.logger.log(f"Sent '{self.graceful_stop_command}' to tmux session '{session}'.")
-        return True
-
-    def backup_existing_jar(self, current: JarInfo | None, incoming_name: str) -> None:
-        if current and current.path.exists():
-            destination = self.backups_dir / f"{timestamp_for_filename()}__{current.path.name}"
-            shutil.move(str(current.path), str(destination))
-            self.logger.log(f"Backed up current jar to {destination}")
-
-        incoming_path = self.server_dir / incoming_name
-        if incoming_path.exists():
-            destination = self.backups_dir / f"{timestamp_for_filename()}__{incoming_path.name}"
-            shutil.move(str(incoming_path), str(destination))
-            self.logger.log(f"Backed up existing target jar to {destination}")
-
-    def prune_old_backups(self) -> None:
-        if not self.cleanup_backups_after_install or self.keep_backups < 0:
-            return
-
-        backups = [path for path in self.backups_dir.iterdir() if path.is_file()]
-        backups.sort(key=lambda item: item.stat().st_mtime, reverse=True)
-        for old_path in backups[self.keep_backups:]:
-            old_path.unlink()
-            self.logger.log(f"Removed old backup {old_path}")
-
-    def format_download_filename(self, build: BuildInfo) -> str:
-        try:
-            return self.download_filename_pattern.format(version=build.version, build=build.build_id)
-        except (KeyError, IndexError, ValueError):
-            return f"Paper-{build.version}-{build.build_id}.jar"
+        return self.server_dir / target_name
 
     def print_dry_run_summary(self, target_path: Path, current: JarInfo | None, build: BuildInfo) -> None:
-        self.logger.log("Dry run: no files were changed.")
+        self.logger.log("Dry run: no server JAR or managed archive files were changed.")
         self.logger.log(f"Dry run: would download {build.download_url}")
         if build.sha256:
             self.logger.log(f"Dry run: expected SHA-256 from API is {build.sha256}")
-        self.logger.log(f"Dry run: would stage the jar in {self.downloads_dir}")
-        if current:
-            self.logger.log(f"Dry run: would back up {current.path.name} into {self.backups_dir}")
+        self.logger.log(f"Dry run: would download to a unique temporary file in {self.server_dir}")
+        self.logger.log(f"Dry run: would atomically stage {target_path.name} beside the existing jar(s)")
         if target_path.exists():
-            self.logger.log(f"Dry run: would also back up existing target jar {target_path.name}")
-        self.logger.log(f"Dry run: would install {target_path}")
-        if self.cleanup_backups_after_install:
-            self.logger.log(f"Dry run: would keep the newest {self.keep_backups} backups after install.")
+            self.logger.log(
+                f"Dry run: {target_path.name} already exists and would only be accepted if its SHA-256 matches the API."
+            )
+        if current:
+            self.logger.log(f"Dry run: existing jar {current.path.name} would remain unchanged.")
+        if self.reconcile_server_jars_after_stage:
+            self.logger.log(
+                f"Dry run: after staging, PaperScript would keep up to {self.keep_server_jars} steady-state "
+                "launcher/newest root jar roles plus any in-flight launcher rollback jar, and cap the "
+                f"per-version jar archive at {self.keep_archived_jars}."
+            )
+        self.logger.log("Dry run: PaperScript would not stop, start, restart, or signal the server process.")
 
-    def install_build(
+    def stage_build(
         self,
         build: BuildInfo,
         force_version_prompt: bool = False,
-        prompt_for_force_reinstall: bool = False,
+        prompt_for_forced_recheck: bool = False,
     ) -> None:
+        if self.args.dry_run:
+            self._stage_build(
+                build,
+                force_version_prompt=force_version_prompt,
+                prompt_for_forced_recheck=prompt_for_forced_recheck,
+            )
+            return
+        with self.server_mutation_lock():
+            self._stage_build(
+                build,
+                force_version_prompt=force_version_prompt,
+                prompt_for_forced_recheck=prompt_for_forced_recheck,
+            )
+
+    def _stage_build(
+        self,
+        build: BuildInfo,
+        force_version_prompt: bool = False,
+        prompt_for_forced_recheck: bool = False,
+    ) -> None:
+        target_path = self.stage_target_path(build)
         current = self.find_current_jar()
-        target_name = self.format_download_filename(build)
-        manual_force_reinstall = False
+        same_family = self.managed_server_jars(build.version)
+        known_same_family_builds = [jar.build for jar in same_family]
+        if current is not None and current.version.casefold() == build.version.casefold():
+            known_same_family_builds.append(current.build)
+        newest_same_family_build = max(known_same_family_builds, default=-1)
+        if build.build_id < newest_same_family_build:
+            raise PaperScriptError(
+                f"Refusing to stage Paper {build.version} build #{build.build_id} while newer same-family "
+                f"build #{newest_same_family_build} exists. 1MB-minecraft.sh always selects the greatest "
+                "numeric build, so the requested downgrade could not become the next launch."
+            )
+        manual_forced_recheck = False
         if current and current.version == build.version and current.build >= build.build_id and not self.args.force:
             if (
                 current.build == build.build_id
-                and prompt_for_force_reinstall
+                and prompt_for_forced_recheck
                 and not self.args.dry_run
                 and sys.stdin.isatty()
             ):
                 if prompt_yes_no(
-                    f"Current jar {current.path.name} is already build #{current.build}. Download it anyway?",
+                    f"Build {current.path.name} is already staged. Re-check it against the Paper API?",
                     default=False,
                     logger=self.logger,
                 ):
                     self.logger.log("Proceeding with a forced re-download of the same build.")
-                    manual_force_reinstall = True
+                    manual_forced_recheck = True
                 else:
                     self.logger.log("Cancelled re-download of the same build.")
                     return
-            if not manual_force_reinstall:
+            if not manual_forced_recheck:
                 self.logger.log(
-                    f"Current jar {current.path.name} is already build #{current.build} for version {current.version}. "
-                    "Nothing newer needs to be downloaded."
+                    f"Newest managed jar {current.path.name} is already build #{current.build} for version {current.version}. "
+                    "Nothing newer needs to be staged."
                 )
                 return
 
         if current and current.version == build.version and current.build < build.build_id and not self.allow_same_version_build_upgrade:
-            self.logger.log("Same-version build upgrades are disabled in config, so the newer build will not be installed.")
+            self.logger.log("Same-version build upgrades are disabled in config, so the newer build will not be staged.")
             return
 
-        force_requested = self.args.force or manual_force_reinstall
-        if current and force_requested and self.confirm_before_force_download and not self.args.yes and not self.args.dry_run and not manual_force_reinstall:
+        force_requested = self.args.force or manual_forced_recheck
+        if current and force_requested and self.confirm_before_force_download and not self.args.yes and not self.args.dry_run and not manual_forced_recheck:
             if not prompt_yes_no(
-                "Force download is enabled. Continue with the requested install?",
+                "Force download is enabled. Continue with the requested stage?",
                 default=False,
                 logger=self.logger,
             ):
@@ -1649,92 +2467,208 @@ class PaperScriptApp:
         elif current and force_requested and self.confirm_before_force_download and self.args.dry_run and not self.args.yes:
             self.logger.log("Dry run: PaperScript would ask for confirmation before a forced download.")
 
-        if current and compare_versions(current.version, build.version) > 0 and self.confirm_before_downgrade and not self.args.yes and not self.args.dry_run:
+        try:
+            launcher_intent_version = self.launcher_jar_selection().version
+        except PaperScriptError:
+            launcher_intent_version = current.version if current is not None else None
+
+        if (
+            launcher_intent_version
+            and compare_versions(launcher_intent_version, build.version) > 0
+            and self.confirm_before_downgrade
+            and not self.args.yes
+            and not self.args.dry_run
+        ):
             if not prompt_yes_no(
-                f"This appears to be a downgrade from version {current.version} to {build.version}. Continue?",
+                f"Stage older Minecraft family {build.version} beside the launcher family "
+                f"{launcher_intent_version}? This does not change launcher selection. Continue?",
                 default=False,
                 logger=self.logger,
             ):
-                self.logger.log("Cancelled downgrade.")
+                self.logger.log("Cancelled older-family staging.")
                 return
         elif (
-            current
-            and compare_versions(current.version, build.version) > 0
+            launcher_intent_version
+            and compare_versions(launcher_intent_version, build.version) > 0
             and self.confirm_before_downgrade
             and self.args.dry_run
             and not self.args.yes
         ):
             self.logger.log(
-                f"Dry run: PaperScript would ask before downgrading from {current.version} to {build.version}."
+                f"Dry run: PaperScript would ask before staging older family {build.version} beside "
+                f"launcher family {launcher_intent_version}; launcher selection would not change."
             )
 
-        if current and compare_versions(current.version, build.version) < 0 and force_version_prompt and not self.args.yes:
+        if (
+            launcher_intent_version
+            and compare_versions(launcher_intent_version, build.version) < 0
+            and force_version_prompt
+            and not self.args.yes
+        ):
             if self.args.dry_run:
                 self.logger.log(
-                    f"Dry run: PaperScript would ask before upgrading from {current.version} to {build.version}."
+                    f"Dry run: PaperScript would ask before staging newer family {build.version} beside "
+                    f"launcher family {launcher_intent_version}."
                 )
             elif not prompt_yes_no(
-                f"This will upgrade from version {current.version} to {build.version}. Continue?",
+                f"Stage newer Minecraft family {build.version} beside launcher family "
+                f"{launcher_intent_version}? This does not change launcher selection. Continue?",
                 default=False,
                 logger=self.logger,
             ):
-                self.logger.log("Cancelled version upgrade.")
+                self.logger.log("Cancelled newer-family staging.")
                 return
-
-        self.ensure_safe_to_upgrade()
-
-        target_path = self.server_dir / target_name
-        temp_path = self.downloads_dir / f"{target_name}.part"
-        final_temp = self.downloads_dir / target_name
 
         if self.args.dry_run:
             self.print_dry_run_summary(target_path, current, build)
             return
 
-        if temp_path.exists():
-            temp_path.unlink()
-        if final_temp.exists():
-            final_temp.unlink()
+        if not build.sha256 or not re.fullmatch(r"[0-9a-fA-F]{64}", str(build.sha256)):
+            raise PaperScriptError(
+                f"Paper API did not provide a valid SHA-256 for {build.filename}; staging was refused."
+            )
+        if target_path.is_symlink() or (target_path.exists() and not target_path.is_file()):
+            raise PaperScriptError(f"Refusing to replace a symlink or non-file staging target: {target_path}")
+        existing_identity: tuple[int, int, int, int, str] | None = None
+        if target_path.exists():
+            existing_stat = target_path.lstat()
+            existing_sha = sha256_file(target_path)
+            if existing_sha.lower() != build.sha256.lower():
+                raise PaperScriptError(
+                    f"Target {target_path.name} already exists with a different SHA-256. "
+                    "PaperScript will not overwrite a possibly active or locally modified jar."
+                )
+            if not force_requested:
+                self.logger.log(
+                    f"Staged target {target_path.name} already exists and matches the Paper API SHA-256; left it unchanged."
+                )
+                self.record_state(build, target_path, existing_sha)
+                self.reconcile_after_stage(build.version, target_path)
+                return
+            existing_identity = (
+                existing_stat.st_dev,
+                existing_stat.st_ino,
+                existing_stat.st_size,
+                existing_stat.st_mtime_ns,
+                existing_sha,
+            )
+            self.logger.log(
+                f"Force re-download will verify fresh bytes for {target_path.name} without replacing the existing file."
+            )
+
+        descriptor, temporary_name = tempfile.mkstemp(
+            dir=self.server_dir,
+            prefix=f".{target_path.name}.",
+            suffix=".part",
+        )
+        os.close(descriptor)
+        temp_path = Path(temporary_name)
+        temp_path.chmod(0o600)
 
         self.logger.log(
             f"Downloading Paper {build.version} build #{build.build_id} "
             f"({build.channel}, {format_bytes(build.size)})..."
         )
-        install_started_at = time.monotonic()
+        stage_started_at = time.monotonic()
         try:
-            verification = self.api.download_file(build, temp_path)
-        except Exception:
+            try:
+                verification = self.api.download_file(build, temp_path)
+            except PaperScriptError:
+                raise
+            except OSError as error:
+                raise PaperScriptError(
+                    f"Download I/O failed for {build.filename}: {error}"
+                ) from error
+            if build.size is not None and verification.bytes_written != build.size:
+                raise PaperScriptError(
+                    f"Downloaded size mismatch for {build.filename}: expected {build.size}, "
+                    f"got {verification.bytes_written} bytes."
+                )
+            if verification.sha256.lower() != build.sha256.lower():
+                raise PaperScriptError(
+                    f"Checksum mismatch for {build.filename}: expected {build.sha256}, got {verification.sha256}"
+                )
+            with temp_path.open("rb+") as handle:
+                os.fsync(handle.fileno())
+            temp_path.chmod(0o644)
+            if existing_identity is not None:
+                if target_path.is_symlink() or not target_path.is_file():
+                    raise PaperScriptError(
+                        f"Existing target {target_path.name} changed type during force re-download; left it unchanged."
+                    )
+                after = target_path.lstat()
+                after_sha = sha256_file(target_path)
+                after_identity = (
+                    after.st_dev,
+                    after.st_ino,
+                    after.st_size,
+                    after.st_mtime_ns,
+                    after_sha,
+                )
+                if after_identity != existing_identity:
+                    raise PaperScriptError(
+                        f"Existing target {target_path.name} changed during force re-download; no file was replaced."
+                    )
+            else:
+                try:
+                    os.link(temp_path, target_path)
+                except FileExistsError as error:
+                    raise PaperScriptError(
+                        f"Target {target_path.name} appeared while the download was in progress; no file was overwritten."
+                    ) from error
+                temp_path.unlink()
+                fsync_directory(self.server_dir)
+        finally:
             if temp_path.exists():
                 temp_path.unlink()
-            raise
-        temp_path.rename(final_temp)
-        self.logger.log(f"Downloaded to {final_temp}")
-        if build.sha256:
-            self.logger.log(f"Expected SHA-256: {build.sha256}")
+
+        if existing_identity is None:
+            self.logger.log(f"Staged: {target_path.name} ({build.channel}, SHA-256 verified)")
+        else:
+            self.logger.log(
+                f"Re-downloaded and verified: {target_path.name} ({build.channel}); existing staged file unchanged"
+            )
+        self.logger.log(f"Expected SHA-256: {build.sha256}")
         self.logger.log(f"Downloaded SHA-256: {verification.sha256}")
-        self.logger.log(
-            f"Checksum verification: {'match' if not build.sha256 or verification.sha256.lower() == build.sha256.lower() else 'mismatch'}"
-        )
         self.logger.log(
             f"Download timing: {format_duration(verification.elapsed_seconds)} at "
             f"{format_rate(verification.bytes_written, verification.elapsed_seconds)}"
         )
-
-        self.backup_existing_jar(current, target_name)
-        shutil.move(str(final_temp), str(target_path))
-        self.logger.log(f"Installed {target_path}")
         self.record_state(build, target_path, verification.sha256)
-        self.prune_old_backups()
-        self.logger.log(f"Total install timing: {format_duration(time.monotonic() - install_started_at)}")
+        self.reconcile_after_stage(build.version, target_path)
+        self.logger.log(f"Total staging timing: {format_duration(time.monotonic() - stage_started_at)}")
+        self.logger.log("PaperScript did not stop, start, restart, or signal the server process.")
+        self.logger.log("Full server, world, plugin, and BlueMap backups are separate and were not run.")
+
+    def reconcile_after_stage(self, version: str, staged_path: Path) -> None:
+        if not self.reconcile_server_jars_after_stage:
+            self.logger.log("Automatic server-root jar retention is disabled in config.")
+            return
+        try:
+            plan = self.plan_server_jar_retention(
+                version,
+                keep=self.keep_server_jars,
+                staged_path=staged_path,
+            )
+            archived = self.apply_server_jar_retention(plan)
+        except PaperScriptError as error:
+            self.logger.log(f"Automatic server-root jar retention deferred: {error}")
+            return
+        rollback_note = "; includes one in-flight launcher rollback jar" if plan.launch_rollback else ""
+        self.logger.log(
+            f"Server-root managed jars: {len(plan.kept)} protected "
+            f"(steady-state limit {self.keep_server_jars}{rollback_note}); "
+            f"archived {archived} older matching jar(s)."
+        )
 
     def run_update(self) -> None:
         self.describe_server_context()
         self.log_api_activity("Contacting Paper API for the latest stable release...")
         target = self.choose_target_for_update()
         if target is None:
-            self.logger.log("Update finished with no download or install changes.")
+            self.logger.log("Update finished with no staging changes.")
             return
-        self.install_build(target, force_version_prompt=False)
+        self.stage_build(target, force_version_prompt=False)
 
     def run_download(self, version: str, build_id: int | None, channel: str) -> None:
         if build_id is not None:
@@ -1745,7 +2679,7 @@ class PaperScriptApp:
                     f"Build #{build_id} was not found for version {version}. "
                     f"Try './paperscript.sh inspect {version}' to see the available builds first."
                 )
-            self.install_build(selected, force_version_prompt=True, prompt_for_force_reinstall=True)
+            self.stage_build(selected, force_version_prompt=True, prompt_for_forced_recheck=True)
             return
 
         selected = self.api.get_latest_build(version, channel=channel)
@@ -1754,12 +2688,61 @@ class PaperScriptApp:
                 f"No {channel.upper()} build was found for version {version}. "
                 f"Try './paperscript.sh inspect {version}' to see which channels exist."
             )
-        self.install_build(selected, force_version_prompt=True, prompt_for_force_reinstall=True)
+        self.stage_build(selected, force_version_prompt=True, prompt_for_forced_recheck=True)
 
     def run_status(self) -> None:
         compact = self.effective_status_view() == "compact"
         properties = parse_properties(self.server_dir / "server.properties")
         current = self.find_current_jar()
+        try:
+            launcher_selection = self.launcher_jar_selection()
+            launcher_marker_error = None
+        except PaperScriptError as error:
+            launcher_selection = None
+            launcher_marker_error = str(error)
+
+        if launcher_selection is not None and launcher_selection.build is not None:
+            last_launched = JarInfo(
+                launcher_selection.path,
+                launcher_selection.version,
+                launcher_selection.build,
+            )
+        else:
+            last_launched = None
+
+        launcher_family_jars = (
+            self.managed_server_jars(launcher_selection.version)
+            if launcher_selection is not None
+            else []
+        )
+        if launcher_selection is None:
+            next_launcher_status = "unknown; launcher identity unavailable"
+        elif launcher_family_jars:
+            next_launcher = launcher_family_jars[0]
+            if next_launcher.path == launcher_selection.path:
+                next_launcher_status = f"{next_launcher.path.name} (same as last selection)"
+            elif launcher_selection.build is None:
+                next_launcher_status = (
+                    f"{next_launcher.path.name} (numeric build supersedes legacy fallback)"
+                )
+            else:
+                next_launcher_status = f"{next_launcher.path.name} (newer than last selection)"
+        else:
+            next_launcher_status = f"{launcher_selection.path.name} (legacy fallback)"
+        status_current = current
+        if launcher_selection is not None:
+            marker_state = self.jar_info_from_state(launcher_selection.path)
+            status_current = (
+                launcher_family_jars[0]
+                if launcher_family_jars
+                else marker_state
+                if marker_state is not None
+                else JarInfo(
+                    launcher_selection.path,
+                    launcher_selection.version,
+                    launcher_selection.build if launcher_selection.build is not None else -1,
+                )
+            )
         running = self.detect_running_server_processes()
         self.log_api_activity("Contacting Paper API for current release data...")
         latest_version, latest_build = self.latest_stable_version()
@@ -1767,7 +2750,7 @@ class PaperScriptApp:
         tmux_available = self.tmux_session_available()
         backup_count = self.backup_file_count()
         metadata_cache_count = self.metadata_cache_file_count()
-        update_relevant = current is None
+        update_relevant = status_current is None
 
         self.logger.kv("PaperScript version", APP_RELEASE)
         self.logger.kv("Server directory", str(self.server_dir))
@@ -1776,7 +2759,7 @@ class PaperScriptApp:
             self.logger.kv("Server label", str(self.server_name or "none"))
             self.logger.kv("tmux session", self.tmux_session)
             self.logger.kv("tmux session available", format_bool(tmux_available))
-            self.logger.kv("Graceful stop command", self.graceful_stop_command)
+            self.logger.kv("Lifecycle control", "manual/external; PaperScript never stops or starts the server")
             self.logger.kv("Server properties found", format_bool((self.server_dir / "server.properties").exists()))
             self.logger.kv("Configured server port", properties.get("server-port", "25565"))
             self.logger.kv("Running server detected", format_bool(bool(running)))
@@ -1784,71 +2767,105 @@ class PaperScriptApp:
                 for pid, command in running:
                     self.logger.kv(f"  PID {pid}", command)
         if current:
-            state_jar = self.state.get("current_jar")
-            state_channel = self.state.get("current_channel") if state_jar == current.path.name else None
+            state_jar = self.state.get("staged_jar") or self.state.get("current_jar")
+            state_channel = (
+                self.state.get("staged_channel") or self.state.get("current_channel")
+            ) if state_jar == current.path.name else None
             current_details = f"{current.path.name} (version {current.version}, build #{current.build}"
             if state_channel:
                 current_details += f", channel {str(state_channel).upper()}"
             current_details += ")"
             self.logger.kv(
-                "Current jar",
+                "Newest managed jar",
                 current_details,
             )
             current_sha = sha256_file(current.path)
             if not compact:
-                self.logger.kv("Current jar path", str(current.path))
-                self.logger.kv("Current jar SHA-256", current_sha)
+                self.logger.kv("Newest managed jar path", str(current.path))
+                self.logger.kv("Newest managed SHA-256", current_sha)
             expected_sha = self.state.get("expected_sha256")
             if expected_sha and state_jar == current.path.name and not compact:
                 self.logger.kv("Expected SHA-256", str(expected_sha))
                 self.logger.kv(
-                    "Current SHA matches expected",
+                    "Newest managed SHA matches expected",
                     format_bool(current_sha.lower() == str(expected_sha).lower()),
                 )
         else:
-            self.logger.kv("Current jar", "none")
+            self.logger.kv("Newest managed jar", "none")
+        if launcher_selection is None:
+            launcher_status = "unknown; run the updated 1MB-minecraft.sh once"
+            if launcher_marker_error and not compact:
+                launcher_status += f" ({launcher_marker_error})"
+        elif launcher_selection.build is None:
+            launcher_status = (
+                f"{launcher_selection.path.name} (legacy name; numeric-build retention is deferred)"
+            )
+        else:
+            launcher_status = launcher_selection.path.name
+        self.logger.kv("Last launcher-selected jar", launcher_status)
+        self.logger.kv(
+            "Predicted next selection (last marker family)",
+            next_launcher_status,
+        )
 
         self.logger.kv(
             f"Latest {self.check_latest_channel_only.lower()} release",
             f"{latest_version} build #{latest_build.build_id}",
         )
-        if current is None:
+        family_latest_build = latest_build
+        if status_current is not None and status_current.version.casefold() != latest_version.casefold():
+            family_latest_build = self.api.get_latest_build(
+                status_current.version,
+                channel=self.check_latest_channel_only,
+            )
+
+        if status_current is None:
             self.logger.kv(
                 "Update status",
-                "no installed jar detected, so PaperScript would offer the latest release.",
+                "no managed jar detected, so PaperScript would offer the latest release.",
             )
             update_relevant = True
+        elif family_latest_build is None:
+            self.logger.kv(
+                "Update status",
+                f"no {self.check_latest_channel_only.lower()} build was found for launcher family {status_current.version}.",
+            )
         else:
-            version_cmp = compare_versions(current.version, latest_version)
-            if version_cmp == 0:
-                if latest_build.build_id > current.build:
-                    self.logger.kv(
-                        "Update status",
-                        f"newer build available for the same version ({current.build} -> {latest_build.build_id}).",
-                    )
-                    update_relevant = True
-                elif latest_build.build_id == current.build:
-                    self.logger.kv("Update status", "already on the latest stable build.")
-                else:
-                    self.logger.kv(
-                        "Update status",
-                        "installed build is newer than the latest stable build this script found.",
-                    )
-            elif version_cmp < 0:
+            if status_current.build < 0:
                 self.logger.kv(
                     "Update status",
-                    f"newer version available ({current.version} -> {latest_version}).",
+                    f"launcher family {status_current.version} uses a legacy jar with an unknown build; "
+                    f"update can stage stable build #{family_latest_build.build_id}.",
                 )
                 update_relevant = True
+            elif family_latest_build.build_id > status_current.build:
+                self.logger.kv(
+                    "Update status",
+                    f"newer stable build available for launcher family {status_current.version} "
+                    f"({status_current.build} -> {family_latest_build.build_id}).",
+                )
+                update_relevant = True
+            elif family_latest_build.build_id == status_current.build:
+                self.logger.kv("Update status", "latest stable build for the launcher family is already staged.")
             else:
                 self.logger.kv(
                     "Update status",
-                    "installed version is newer than the latest stable version this script found.",
+                    "newest managed build for the launcher family is newer than the latest stable build this script found.",
                 )
 
+        if status_current is not None and compare_versions(latest_version, status_current.version) > 0:
+            self.logger.kv(
+                "Newer Minecraft family",
+                f"{latest_version} build #{latest_build.build_id}; update remains on {status_current.version}.",
+            )
+            self.log_command_hint(
+                f"After reviewing launcher/plugin compatibility, stage it explicitly with "
+                f"'./paperscript.sh download --version {latest_version} --channel STABLE'."
+            )
+            update_relevant = True
         self.log_command_hint(
-            "Use './paperscript.sh stable' to inspect the latest stable release, './paperscript.sh update' to install it, "
-            "or './paperscript.sh --force update' to re-download it even if it is already installed."
+            "Use './paperscript.sh stable' to inspect the latest stable release, './paperscript.sh update' to stage "
+            "the newest stable build for the launcher family, or './paperscript.sh --force update' to re-check it."
         )
         self.log_release_page(update_relevant)
 
@@ -1878,13 +2895,20 @@ class PaperScriptApp:
                 f"{latest_preview_version} build #{latest_preview_build.build_id} ({latest_preview_build.channel})",
             )
             self.log_command_hint(
-                "Use './paperscript.sh experimental' to inspect it, or './paperscript.sh experimental --download' to install it."
+                "Use './paperscript.sh experimental' to inspect it, or './paperscript.sh experimental --download' to stage it."
             )
         self.logger.kv(
-            "Backup retention",
-            f"keep {self.keep_backups} backups, cleanup after install {format_bool(self.cleanup_backups_after_install)}",
+            "Server-root jar retention",
+            f"steady-state limit {self.keep_server_jars} for last-launched/newest roles; "
+            "one in-flight launcher rollback may be added; reconcile after stage "
+            f"{format_bool(self.reconcile_server_jars_after_stage)}",
         )
-        self.logger.kv("Backups found", f"{backup_count} file(s)")
+        if last_launched:
+            self.logger.kv(
+                f"Jar archive ({last_launched.version})",
+                f"{self.managed_jar_archive_count(last_launched.version)}/{self.keep_archived_jars} file(s)",
+            )
+        self.logger.kv("Legacy backups found", f"{backup_count} file(s)")
         self.logger.kv(
             "Metadata cache",
             f"{'enabled' if self.metadata_cache_enabled else 'disabled'}, "
@@ -1893,13 +2917,13 @@ class PaperScriptApp:
         if backup_count > 0:
             if self.keep_backups >= 0 and backup_count > self.keep_backups:
                 self.log_command_hint(
-                    f"Run './paperscript.sh cleanup --backups --keep {self.keep_backups}' to trim older backups, "
-                    "or './paperscript.sh cleanup --backups' to delete them all.",
+                    f"Run './paperscript.sh cleanup --backups --keep {self.keep_backups}' to trim older legacy backups, "
+                    "or './paperscript.sh cleanup --backups' to delete those legacy items.",
                     important=True,
                 )
             elif not compact:
                 self.log_command_hint(
-                    "Run './paperscript.sh cleanup --backups' to delete all backup jars if you no longer need rollback copies."
+                    "Run './paperscript.sh cleanup --backups' to delete legacy backup items; the managed JAR archive is preserved."
                 )
         if metadata_cache_count > 0 and not compact:
             self.log_command_hint(
@@ -1919,7 +2943,7 @@ class PaperScriptApp:
         )
         self.log_release_page(relevant=True)
         if download:
-            self.install_build(build, force_version_prompt=False, prompt_for_force_reinstall=True)
+            self.stage_build(build, force_version_prompt=True, prompt_for_forced_recheck=True)
 
     def run_experimental(self, download: bool = False) -> None:
         self.log_api_activity("Contacting Paper API for the latest preview release newer than stable...")
@@ -1947,42 +2971,42 @@ class PaperScriptApp:
         )
         self.log_release_page(relevant=True)
         if download:
-            self.install_build(build, force_version_prompt=True, prompt_for_force_reinstall=True)
+            self.stage_build(build, force_version_prompt=True, prompt_for_forced_recheck=True)
 
     def run_verify(self) -> None:
         current = self.find_current_jar()
         if not current:
-            raise PaperScriptError("No current Paper jar was detected to verify.")
+            raise PaperScriptError("No managed Paper jar was detected to verify.")
 
         current_sha = sha256_file(current.path)
         self.logger.log(
             f"Verify target: {current.path.name} (version {current.version}, build #{current.build})"
         )
-        self.logger.log(f"Current SHA-256: {current_sha}")
+        self.logger.log(f"Newest managed SHA-256: {current_sha}")
 
-        state_jar = self.state.get("current_jar")
-        state_channel = self.state.get("current_channel")
+        state_jar = self.state.get("staged_jar") or self.state.get("current_jar")
+        state_channel = self.state.get("staged_channel") or self.state.get("current_channel")
         state_expected = self.state.get("expected_sha256")
-        state_current = self.state.get("current_sha256")
+        state_current = self.state.get("staged_sha256") or self.state.get("current_sha256")
         if state_jar == current.path.name:
             if state_channel:
-                self.logger.log(f"Recorded install channel: {str(state_channel).upper()}")
+                self.logger.log(f"Recorded staging channel: {str(state_channel).upper()}")
             if not state_current and not state_expected:
-                self.logger.log("Recorded install state exists for this jar, but it does not contain stored SHA-256 values yet.")
+                self.logger.log("Recorded staging state exists for this jar, but it does not contain stored SHA-256 values yet.")
             if state_current:
-                self.logger.log(f"Recorded SHA-256 from install time: {state_current}")
+                self.logger.log(f"Recorded SHA-256 from staging time: {state_current}")
                 self.logger.log(
-                    f"Current SHA-256 matches recorded install SHA: "
+                    f"Newest managed SHA-256 matches recorded staging SHA: "
                     f"{format_bool(current_sha.lower() == str(state_current).lower())}"
                 )
             if state_expected:
                 self.logger.log(f"Recorded expected SHA-256: {state_expected}")
                 self.logger.log(
-                    f"Current SHA-256 matches recorded expected SHA: "
+                    f"Newest managed SHA-256 matches recorded expected SHA: "
                     f"{format_bool(current_sha.lower() == str(state_expected).lower())}"
                 )
         else:
-            self.logger.log("Recorded install state does not match the currently detected jar, so local state comparison is unavailable.")
+            self.logger.log("Recorded staging state does not match the currently detected jar, so local state comparison is unavailable.")
 
         api_build: BuildInfo | None = None
         try:
@@ -1999,7 +3023,7 @@ class PaperScriptApp:
         if api_build.sha256:
             self.logger.log(f"API expected SHA-256: {api_build.sha256}")
             self.logger.log(
-                f"Current SHA-256 matches API expected SHA: "
+                f"Newest managed SHA-256 matches API expected SHA: "
                 f"{format_bool(current_sha.lower() == api_build.sha256.lower())}"
             )
         else:
@@ -2010,6 +3034,7 @@ class PaperScriptApp:
             "all": bool(getattr(self.args, "cleanup_all", False)),
             "downloads": bool(getattr(self.args, "cleanup_downloads", False)),
             "backups": bool(getattr(self.args, "cleanup_backups", False)),
+            "server_jars": bool(getattr(self.args, "cleanup_server_jars", False)),
             "metadata_cache": bool(getattr(self.args, "cleanup_metadata_cache", False)),
             "pycache": bool(getattr(self.args, "cleanup_pycache", False)),
             "logs": bool(getattr(self.args, "cleanup_logs", False)),
@@ -2018,8 +3043,15 @@ class PaperScriptApp:
         if selected["all"]:
             for key in ["downloads", "backups", "metadata_cache", "pycache", "logs", "json"]:
                 selected[key] = True
+        if selected["backups"] and selected["server_jars"]:
+            raise PaperScriptError(
+                "--backups/--all cannot be combined with --server-jars; clean them in separate commands."
+            )
+        if getattr(self.args, "cleanup_version", None) is not None and not selected["server_jars"]:
+            raise PaperScriptError("cleanup --version requires the explicit --server-jars target.")
         if getattr(self.args, "cleanup_keep", None) is not None:
-            selected["backups"] = True
+            if not selected["server_jars"]:
+                selected["backups"] = True
         if not any(selected.values()):
             selected["downloads"] = True
             selected["pycache"] = True
@@ -2028,13 +3060,27 @@ class PaperScriptApp:
     def cleanup_descriptions(self, selection: dict[str, bool]) -> list[str]:
         descriptions: list[str] = []
         if selection["downloads"]:
-            descriptions.append(f"Delete staged downloads and temp files in {self.downloads_dir}")
+            descriptions.append(f"Delete old download-workspace items in {self.downloads_dir}")
         if selection["backups"]:
             keep = getattr(self.args, "cleanup_keep", None)
             if keep is None:
-                descriptions.append(f"Delete all backup jars in {self.backups_dir}")
+                descriptions.append(
+                    f"Delete legacy top-level backup items in {self.backups_dir} while preserving {self.jar_archive_dir}"
+                )
             else:
-                descriptions.append(f"Trim backup jars in {self.backups_dir} so only the newest {keep} remain")
+                descriptions.append(
+                    f"Trim legacy top-level backup items in {self.backups_dir} so only the newest {keep} remain"
+                )
+        if selection["server_jars"]:
+            keep = getattr(self.args, "cleanup_keep", None)
+            keep_count = self.keep_server_jars if keep is None else int(keep)
+            requested_version = getattr(self.args, "cleanup_version", None)
+            version_label = requested_version or "the version in the launcher marker"
+            descriptions.append(
+                f"Keep the last-launched jar plus the greatest numeric next-start jar (steady-state limit "
+                f"{keep_count}) and any in-flight launcher rollback jar for {version_label}; archive older "
+                f"exact numeric builds under {self.jar_archive_dir}"
+            )
         if selection["metadata_cache"]:
             descriptions.append(f"Delete cached Paper API metadata in {self.metadata_cache_dir}")
         if selection["pycache"]:
@@ -2047,11 +3093,18 @@ class PaperScriptApp:
             )
         return descriptions
 
-    def remove_directory_contents(self, path: Path) -> int:
+    def remove_directory_contents(
+        self,
+        path: Path,
+        excluded_paths: tuple[Path, ...] = (),
+    ) -> int:
         if not path.exists():
             return 0
+        excluded = set(excluded_paths)
         removed = 0
         for child in path.iterdir():
+            if child in excluded:
+                continue
             if child.is_dir():
                 shutil.rmtree(child)
             else:
@@ -2133,7 +3186,44 @@ class PaperScriptApp:
         for description in descriptions:
             self.logger.log(f"  - {description}")
 
+        server_jar_plan: JarRetentionPlan | None = None
+        if selection["server_jars"]:
+            marker_jar = self.last_launched_jar()
+            requested_version = getattr(self.args, "cleanup_version", None)
+            version = str(requested_version or marker_jar.version)
+            keep = getattr(self.args, "cleanup_keep", None)
+            keep_count = self.keep_server_jars if keep is None else int(keep)
+            staged_path = self.recorded_staged_jar(version)
+            server_jar_plan = self.plan_server_jar_retention(
+                version,
+                keep=keep_count,
+                staged_path=staged_path,
+            )
+            self.logger.log(
+                f"Protected last-launched jar: {server_jar_plan.last_launched.name}"
+            )
+            if server_jar_plan.launch_rollback is not None:
+                self.logger.log(
+                    f"Protected in-flight launcher rollback jar: {server_jar_plan.launch_rollback.name}"
+                )
+            for path in server_jar_plan.kept:
+                if path not in {
+                    server_jar_plan.last_launched,
+                    server_jar_plan.launch_rollback,
+                }:
+                    self.logger.log(f"Protected staged/newest jar: {path.name}")
+            if not server_jar_plan.to_archive:
+                self.logger.log("No older matching server-root jars need to be archived.")
+            for path in server_jar_plan.to_archive:
+                self.logger.log(f"Will archive older server-root jar: {path.name}")
+            for path in server_jar_plan.to_prune:
+                self.logger.log(
+                    f"Will permanently prune archived Paper jar beyond the configured cap: {path}"
+                )
+
         if self.args.dry_run:
+            if server_jar_plan is not None:
+                self.apply_server_jar_retention(server_jar_plan, dry_run=True)
             self.logger.log("Dry run: no files were deleted.")
             return
 
@@ -2144,10 +3234,36 @@ class PaperScriptApp:
 
         removed_downloads = 0
         removed_backups = 0
+        archived_server_jars = 0
         removed_metadata_cache = 0
         removed_pycache = 0
         cleared_logs = False
         removed_json = 0
+
+        if selection["server_jars"]:
+            marker_jar = self.last_launched_jar()
+            requested_version = getattr(self.args, "cleanup_version", None)
+            version = str(requested_version or marker_jar.version)
+            keep = getattr(self.args, "cleanup_keep", None)
+            keep_count = self.keep_server_jars if keep is None else int(keep)
+            with self.server_mutation_lock():
+                self.state = self._load_json(self.state_path)
+                staged_path = self.recorded_staged_jar(version)
+                locked_plan = self.plan_server_jar_retention(
+                    version,
+                    keep=keep_count,
+                    staged_path=staged_path,
+                )
+                if locked_plan != server_jar_plan:
+                    raise PaperScriptError(
+                        "Server-root jars or launcher/staging identity changed after the cleanup plan was shown. "
+                        "Nothing was archived; re-run cleanup to review the new plan."
+                    )
+                archived_server_jars = self.apply_server_jar_retention(locked_plan)
+            self.logger.log(
+                f"Archived {archived_server_jars} older matching server-root jar(s); "
+                f"kept {len(locked_plan.kept)} protected jar(s) in {self.server_dir}"
+            )
 
         if selection["downloads"]:
             removed_downloads = self.remove_directory_contents(self.downloads_dir)
@@ -2155,8 +3271,14 @@ class PaperScriptApp:
 
         if selection["backups"]:
             if getattr(self.args, "cleanup_keep", None) is None:
-                removed_backups = self.remove_directory_contents(self.backups_dir)
-                self.logger.log(f"Removed {removed_backups} item(s) from {self.backups_dir}")
+                removed_backups = self.remove_directory_contents(
+                    self.backups_dir,
+                    excluded_paths=(self.jar_archive_dir,),
+                )
+                self.logger.log(
+                    f"Removed {removed_backups} legacy backup item(s) from {self.backups_dir}; "
+                    f"managed jar archive {self.jar_archive_dir} was preserved"
+                )
             else:
                 removed_backups = self.trim_backups_to_keep(int(self.args.cleanup_keep))
                 self.logger.log(
@@ -2188,6 +3310,7 @@ class PaperScriptApp:
             "Cleanup finished: "
             f"downloads={removed_downloads}, "
             f"backups={removed_backups}, "
+            f"server_jars_archived={archived_server_jars}, "
             f"metadata_cache={removed_metadata_cache}, "
             f"pycache={removed_pycache}, "
             f"json={removed_json}, "
@@ -2199,17 +3322,14 @@ class PaperScriptApp:
             self.logger.log(summary)
 
 
-def timestamp_for_filename() -> str:
-    return datetime.now().strftime("%Y%m%d-%H%M%S")
-
-
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="paperscript.sh",
-        description="Download and upgrade Paper server jars through the Fill v3 API.",
+        description="Manually stage verified, versioned Paper server jars through the Fill v3 API.",
         epilog=(
             f"Project and examples: {PROJECT_URL}\n"
-            "Use 'update' for the latest stable release, or 'download --version ... --build ...' for an exact jar."
+            "Use 'update' for the latest stable build in the launcher-selected family, or "
+            "'download --version ... --build ...' for an exact jar."
         ),
     )
     parser.add_argument("--server-dir", help="Target server directory. Defaults to the current directory.")
@@ -2219,7 +3339,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--tmux-session",
-        help="tmux session name to use for graceful stop. Defaults to config, PAPERSCRIPT_TMUX_SESSION, or mcserver.",
+        help="tmux session name to show in read-only status. Defaults to config, PAPERSCRIPT_TMUX_SESSION, or mcserver.",
     )
     parser.add_argument(
         "--contact",
@@ -2239,17 +3359,17 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--force",
         action="store_true",
-        help="Force reinstall even if the same build is already present. Useful with update, stable, experimental, or download.",
+        help="Allow the same build through selection again; existing jar targets are never overwritten.",
     )
     parser.add_argument(
         "--dry-run",
         action="store_true",
-        help="Show what PaperScript would do without changing files or stopping servers.",
+        help="Show what PaperScript would do without downloading, moving, or pruning files.",
     )
     parser.add_argument(
         "--quiet",
         action="store_true",
-        help="Suppress normal console output. Useful for cron or scheduled tasks; logs still go to logs.log.",
+        help="Suppress normal console output; logs still go to logs.log.",
     )
     parser.add_argument(
         "--no-color",
@@ -2269,8 +3389,11 @@ def build_parser() -> argparse.ArgumentParser:
 
     subparsers = parser.add_subparsers(dest="command")
 
-    subparsers.add_parser("update", help="Download the latest stable Paper build when appropriate.")
-    status_parser = subparsers.add_parser("status", help="Show current server state and whether an update is available.")
+    subparsers.add_parser("update", help="Stage the latest stable build for the launcher-selected Paper family.")
+    status_parser = subparsers.add_parser(
+        "status",
+        help="Show launcher, staged-JAR, retention, and release state.",
+    )
     status_parser.add_argument(
         "--compact",
         dest="status_compact",
@@ -2283,46 +3406,59 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Force the full status view even if config defaults to compact.",
     )
-    subparsers.add_parser("verify", help="Verify the current jar SHA-256 against recorded state and the live API when available.")
+    subparsers.add_parser("verify", help="Verify the newest managed jar SHA-256 against recorded state and the live API when available.")
     stable_parser = subparsers.add_parser(
         "stable",
-        help="Show or download the latest stable Paper release overall.",
+        help="Show and optionally stage the latest stable Paper release overall.",
     )
     stable_parser.add_argument(
         "--download",
         action="store_true",
-        help="Download and install the latest stable release overall.",
+        help="Download, verify, and stage the latest stable release overall.",
     )
     experimental_parser = subparsers.add_parser(
         "experimental",
-        help="Show or download the latest preview Paper release that is newer than the current stable release.",
+        help="Show and optionally stage the latest preview release newer than stable.",
     )
     experimental_parser.add_argument(
         "--download",
         action="store_true",
-        help="Download and install the latest preview release that is newer than the current stable release.",
+        help="Download, verify, and stage the latest preview release that is newer than the current stable release.",
     )
     cleanup_parser = subparsers.add_parser(
         "cleanup",
-        help="Remove selected runtime files such as downloads, backups, __pycache__, logs, or JSON state/config.",
+        help="Clean selected runtime files or explicitly archive older server-root Paper JARs.",
     )
     cleanup_parser.add_argument(
         "--all",
         dest="cleanup_all",
         action="store_true",
-        help="Clean downloads, backups, __pycache__, logs, and JSON state/config together.",
+        help=(
+            "Clean downloads, legacy backups, metadata cache, __pycache__, logs, and JSON state/config. "
+            "The managed JAR archive and server-root JARs are preserved."
+        ),
     )
     cleanup_parser.add_argument(
         "--downloads",
         dest="cleanup_downloads",
         action="store_true",
-        help="Delete staged downloads and temporary files in downloads/.",
+        help="Delete old workspace and temporary files in downloads/.",
     )
     cleanup_parser.add_argument(
         "--backups",
         dest="cleanup_backups",
         action="store_true",
-        help="Delete all files in backups/, or trim them when used with --keep.",
+        help="Delete or trim legacy top-level backups while preserving the managed backups/jars/ archive.",
+    )
+    cleanup_parser.add_argument(
+        "--server-jars",
+        dest="cleanup_server_jars",
+        action="store_true",
+        help=(
+            "Archive older exact Paper-<version>-<build>.jar files from the server root while "
+            "protecting the launcher-marked jar, greatest numeric next-start jar, and any in-flight "
+            "launcher rollback jar. Never implied by --all."
+        ),
     )
     cleanup_parser.add_argument(
         "--metadata-cache",
@@ -2335,7 +3471,17 @@ def build_parser() -> argparse.ArgumentParser:
         dest="cleanup_keep",
         type=int,
         default=None,
-        help="When cleaning backups, keep the newest N backup files instead of deleting them all.",
+        help=(
+            "With --server-jars, keep a steady-state limit of N matching root jars (minimum 2); "
+            "an in-flight launcher rollback may temporarily add one. "
+            "Otherwise keep the newest N backup files."
+        ),
+    )
+    cleanup_parser.add_argument(
+        "--version",
+        dest="cleanup_version",
+        default=None,
+        help="With --server-jars, manage only this Minecraft version; defaults to the launcher marker version.",
     )
     cleanup_parser.add_argument(
         "--pycache",
@@ -2379,15 +3525,18 @@ def build_parser() -> argparse.ArgumentParser:
     inspect_parser = subparsers.add_parser("inspect", help="Show the latest builds for one version.")
     inspect_parser.add_argument("version", help="Minecraft version to inspect, for example 26.2 or 1.20.4")
 
-    subparsers.add_parser("explore", help="Interactively pick a version, inspect it, and optionally download it.")
+    subparsers.add_parser("explore", help="Interactively pick a version, inspect it, and optionally stage it.")
     init_parser = subparsers.add_parser(
         "init",
         help="Create or repair the PaperScript runtime files in paperscript/ with confirmation.",
     )
 
-    download_parser = subparsers.add_parser("download", help="Download a chosen version or exact build.")
-    download_parser.add_argument("--version", required=True, help="Minecraft version to download.")
-    download_parser.add_argument("--build", type=int, help="Exact build number to download.")
+    download_parser = subparsers.add_parser(
+        "download",
+        help="Download, verify, and stage a chosen version or exact build in the server root.",
+    )
+    download_parser.add_argument("--version", required=True, help="Minecraft version to stage.")
+    download_parser.add_argument("--build", type=int, help="Exact build number to stage.")
     download_parser.add_argument(
         "--channel",
         default=None,

@@ -1,6 +1,6 @@
 # PaperScript
 
-PaperScript is a dependency-free updater for Paper servers that uses the current PaperMC Fill v3 downloads service.
+PaperScript is a dependency-free, manually invoked Paper JAR staging tool that uses the current PaperMC Fill v3 downloads service. It downloads a verified, versioned JAR beside the one already in use; it never stops, starts, restarts, or signals the server.
 
 It is designed for the layout where your server root stays readable, while PaperScript keeps its own files in a visible `paperscript/` directory:
 
@@ -14,14 +14,16 @@ It is designed for the layout where your server root stays readable, while Paper
 /anydirectory/paperscript/config.example.json
 /anydirectory/paperscript/config.json
 /anydirectory/paperscript/state.json
+/anydirectory/paperscript/last-launched-jar.txt
 /anydirectory/paperscript/cache/
 /anydirectory/paperscript/downloads/
-/anydirectory/paperscript/backups/
+/anydirectory/paperscript/backups/jars/26.2/
+/anydirectory/paperscript/locks/
 /anydirectory/paperscript/logs.log
 /anydirectory/paperscript/todo.log
 ```
 
-This makes it easy to `git pull`, wipe PaperScript runtime files, or move between macOS and Ubuntu without flooding the server root with updater clutter.
+This keeps staging-tool clutter out of the server root and makes the disposable cache, download workspace, and logs easy to clean. Preserve `config.json`, `state.json`, `last-launched-jar.txt`, and the tracked PaperScript source files unless you intentionally want to reset them.
 
 ## Why Python Instead Of Bash
 
@@ -40,71 +42,80 @@ Bash still has a place here, which is why the launcher remains a simple `papersc
 - Sends a custom User-Agent by default:
   `mrfloris-PaperScript/2.0 (https://github.com/mrfdev/PaperScript)`
 - Finds the latest stable Paper version and latest stable build automatically.
-- Can inspect and install the latest preview release that is newer than the current stable line, preferring `BETA` and falling back to `ALPHA`.
-- Only auto-updates when the stable build is newer for the same version.
-- Prompts before cross-version upgrades.
-- Prompts before downgrades.
+- Can inspect and stage the latest preview release that is newer than the current stable line, preferring `BETA` and falling back to `ALPHA`.
+- Stages a newer same-version stable build only when the command is run manually.
+- Prompts before staging a newer or older Minecraft version family.
 - Supports forced re-download of the same build with `--force`.
 - Verifies downloads against the API-provided SHA-256.
-- Stores the installed SHA-256 in `state.json` for later `verify` checks.
+- Stores staged-build identity and SHA-256 in `state.json` for later `verify` checks.
 - Caches Paper API metadata locally so repeated release checks are faster.
-- Backs up the current jar before replacing it.
-- Keeps only the newest 10 backups by default.
-- Can trim backups to a chosen count with `cleanup --backups --keep N`.
-- Detects likely running servers using `server-port`, process checks, and tmux-aware graceful stop attempts.
-- Uses tmux by preference for graceful stop and falls back to `SIGTERM`.
+- Publishes the verified download atomically as `Paper-<version>-<build>.jar` without replacing an existing JAR.
+- Uses the launcher's atomic `last-launched-jar.txt` marker to protect the JAR selected for the last start.
+- Keeps the last-launched JAR plus the newest staged JAR in the server root by default.
+- While a launcher/JVM run is in flight, temporarily protects its one prior rollback JAR as well.
+- Archives older exact same-version numeric builds under `paperscript/backups/jars/<version>/` and keeps five by default.
+- Provides explicit `cleanup --server-jars --keep N --dry-run` reconciliation.
+- Serializes staging and root-JAR cleanup with a per-server lock.
+- Refuses overlapping launcher runs with a fail-closed lock held for the JVM lifetime.
+- Detects likely running servers and tmux sessions for read-only status only.
 - Supports `--dry-run`, `--quiet`, `--no-color`, and per-server config defaults.
 - Supports color themes and a compact or full status view.
-- Keeps updater runtime files isolated inside `paperscript/`.
+- Keeps each target server's runtime files isolated inside that server's `paperscript/` directory.
 
 ## Requirements
 
 - Python `3.9+`
 - `python3` available on your path
-- `tmux` if you want graceful stop support
+- `tmux` only if you want its session shown in read-only status
 
 No third-party Python packages are required.
 
 ## Setup
 
-Clone the repo into the server directory or a test directory:
+For a central checkout that targets an existing server, clone separately and pass the server root explicitly:
 
 ```bash
-git clone https://github.com/mrfdev/PaperScript.git
-cd PaperScript
+git clone https://github.com/mrfdev/PaperScript.git /opt/PaperScript
+cd /opt/PaperScript
 chmod +x paperscript.sh paperscript/paperscript.py
+./paperscript.sh --server-dir /srv/minecraft/live status
 ```
+
+For the compact layout shown above, place `paperscript.sh` and the tracked `paperscript/` directory directly in the server root. Do not run from a child checkout without `--server-dir`, because the current working directory is the default target.
 
 If you want to initialize or repair the runtime files manually:
 
 ```bash
-./paperscript.sh init
+./paperscript.sh --server-dir /srv/minecraft/live init
 ```
 
-That creates or repairs the local runtime pieces in `paperscript/` and asks for confirmation before it changes anything.
+In a compact in-root installation, the shorter `./paperscript.sh init` is equivalent. App startup may create target-local config, directories, and logging scaffolding; `init` asks before creating or repairing its remaining runtime files.
 
 ## Refreshing An Existing Live Server
 
 If you already run a live server and want to replace an older local PaperScript checkout with a fresh copy from GitHub, the normal safe path is:
 
 ```bash
-./paperscript.sh status
-./paperscript.sh update --dry-run
-./paperscript.sh update
+./paperscript.sh --server-dir /srv/minecraft/live status
+./paperscript.sh --server-dir /srv/minecraft/live update --dry-run
+./paperscript.sh --server-dir /srv/minecraft/live update
 ```
 
-For servers that use the default jar naming pattern, such as `Paper-26.2-84.jar`, a fresh PaperScript checkout can detect the current jar, back it up, and replace it with the newest stable build.
+These examples assume a central checkout. In the compact in-root layout, omit the repeated `--server-dir` option.
 
-If your server uses a custom installed jar name such as `Paper-26.2.jar`, keep your local `paperscript/config.json` and `paperscript/state.json` or restore their equivalent settings after refreshing the checkout. In particular, if you changed:
+For servers that use the required numeric naming pattern, such as `Paper-26.2-84.jar`, PaperScript detects the newest local build and stages the next verified build beside it. The updated `1MB-minecraft.sh` selects the greatest numeric build for its configured Minecraft version on the next manual start.
 
-- `download_filename_pattern`
+Keep your local `paperscript/config.json`, `paperscript/state.json`, and `paperscript/last-launched-jar.txt` when refreshing the checkout. In particular, review changes to:
+
 - `default_channel`
 - `check_latest_channel_only`
 - `tmux_session`
 
 then deleting the whole `paperscript/` runtime directory will also delete those per-server preferences.
 
-If you intentionally want a completely fresh PaperScript runtime, re-check `./paperscript.sh status` before `update` so you can confirm that the detected current jar and target install name still match your server layout.
+PaperScript always stages the canonical `Paper-<version>-<numeric-build>.jar` name. Legacy names such as `Paper-26.2.jar` remain launcher fallbacks, but PaperScript never overwrites them.
+
+If you intentionally want a fresh runtime, start once with the updated `1MB-minecraft.sh` before root-JAR cleanup. Until a valid marker exists, staging succeeds but automatic root cleanup is deliberately deferred.
 
 ## Quick Start
 
@@ -114,13 +125,13 @@ Show the current state:
 ./paperscript.sh status
 ```
 
-Install the latest stable Paper release when appropriate:
+Stage the latest stable Paper build for the launcher-selected Minecraft family:
 
 ```bash
 ./paperscript.sh update
 ```
 
-Force a re-download of the current latest stable build:
+Force a re-download and verification of the latest stable build for that launcher family:
 
 ```bash
 ./paperscript.sh --force update
@@ -142,16 +153,18 @@ Download that preview build:
 
 ### `update`
 
-Checks the server directory, detects the latest stable Paper release, and installs it when appropriate.
+Checks the server directory, finds the latest stable build for the launcher-selected family, and stages it beside existing JARs when appropriate.
 
 Behavior:
 
-- If no current Paper jar is detected, it offers the latest stable build.
-- If your current version matches the newest stable version, it only downloads when the build number is newer.
-- If your current version and build already match the newest stable release, `--force update` re-downloads it.
-- If the newest stable version is a newer Minecraft version, PaperScript asks before upgrading.
-- If `server.properties` exists and a likely matching Java process is running, PaperScript asks how to proceed.
-- If `--dry-run` is used, it reports what it would do without changing files or stopping anything.
+- If no managed Paper JAR is detected, it offers the latest stable build.
+- If the launcher-selected version has a newer stable build, it stages that build.
+- If the newest staged build for the launcher family already matches stable, `--force update` re-downloads and verifies it without replacing the existing file.
+- `update` stays on the launcher-selected Minecraft version even when a newer family exists; cross-version staging requires an explicit `download --version ...` command.
+- The download is SHA-256 and size verified, fsynced, then atomically published under its numeric build filename.
+- PaperScript never asks to stop the server and contains no stop/kill path.
+- After staging, valid launcher identity enables bounded root cleanup; missing/invalid identity defers cleanup without guessing.
+- If `--dry-run` is used, it reports JAR/archive actions without staging, moving, or pruning JARs; normal target-local config, logging, and metadata-cache activity may still occur.
 
 Examples:
 
@@ -160,14 +173,13 @@ Examples:
 ./paperscript.sh update
 ./paperscript.sh --force update
 ./paperscript.sh update --dry-run
-./paperscript.sh --yes --quiet update
 ./paperscript.sh --no-color update
 ./paperscript.sh --server-dir /srv/mc/live update
 ```
 
 ### `status`
 
-Shows the current PaperScript and Paper server state, the newest stable release, and the newest preview release beyond stable when one exists.
+Shows PaperScript, launcher, staged-JAR, retention, and release state, including the newest preview release beyond stable when one exists.
 
 The normal full view can include:
 
@@ -175,18 +187,20 @@ The normal full view can include:
 - server directory and runtime directory
 - server label
 - tmux session name and whether it currently exists
-- graceful stop command
+- manual/external lifecycle policy
 - server properties detection
 - configured server port
 - running server detection
-- current jar, full path, version, build, recorded install channel, and SHA-256
-- stored expected SHA-256 from the last PaperScript install
+- newest managed jar, full path, version, build, staged channel, and SHA-256
+- last launcher-selected jar, including a clearly labelled legacy marker when applicable
+- the predicted next JAR for the family in the last launcher marker, including legacy fallback state; PaperScript does not execute or infer later edits to `_minecraftVersion`
+- stored expected SHA-256 from the last PaperScript stage
 - newest stable release
 - update status
 - newest channels for the current stable version
 - newest preview release beyond stable
-- backup retention settings
-- backup file count and cleanup suggestions when useful
+- server-root retention and bounded archive settings
+- historical backup/archive counts and cleanup suggestions when useful
 
 Status views:
 
@@ -207,7 +221,7 @@ Examples:
 
 ### `stable`
 
-Shows the latest stable Paper release overall and can install it directly.
+Shows the latest stable Paper release overall and can stage it directly.
 
 This is useful when you want a clear stable overview without running a full update flow first.
 
@@ -244,11 +258,11 @@ Examples:
 
 ### `verify`
 
-Hashes the current installed jar and compares it against:
+Hashes the newest managed jar and compares it against:
 
-- the SHA-256 recorded in `state.json` during the last PaperScript install
+- the SHA-256 recorded in `state.json` during the last PaperScript stage
 - the expected SHA-256 from the live Paper API for that exact version and build
-- the recorded install channel and current channel reported by the API
+- the recorded staging channel and current channel reported by the API
 
 Examples:
 
@@ -290,7 +304,7 @@ This is useful for questions like:
 
 Shows the newest available build per channel for one specific version, then offers to download one interactively.
 
-If the selected build is already installed, PaperScript can offer a direct `Download it anyway?` confirmation so you can re-download the same jar without leaving the inspect flow.
+If the selected build is already staged, PaperScript can offer a direct confirmation. An existing target is never overwritten: it is accepted only when its SHA-256 already matches PaperMC.
 
 Examples:
 
@@ -304,7 +318,7 @@ Examples:
 
 Interactive version picker. It lists all available versions, lets you choose one by number, shows the newest builds for that version, and can then download it.
 
-If the build you choose is already installed, `explore` can offer the same `Download it anyway?` flow as `inspect`.
+If the build you choose is already staged, `explore` can offer the same confirmation flow as `inspect`.
 
 Examples:
 
@@ -314,7 +328,7 @@ Examples:
 
 ### `download`
 
-Downloads a chosen version or exact build on demand.
+Downloads, verifies, and stages a chosen version or exact build on demand.
 
 Examples:
 
@@ -334,13 +348,14 @@ Notes:
 - `--build` downloads that exact build number for the version.
 - The default channel comes from `config.json` and defaults to `STABLE`.
 - Version upgrades still prompt unless you add `--yes`.
-- `--force` lets you re-download and reinstall the same build even if it is already present.
+- `--force` allows an already-selected build through the command flow, but never overwrites an existing target path.
+- PaperScript refuses same-version build downgrades because `1MB-minecraft.sh` always chooses the greatest numeric build, so an older file could not become the next launch.
 - Use `./paperscript.sh --force update` to re-download the current latest stable build.
 - Use `./paperscript.sh --force download --version <version> --build <build>` to re-download one exact build.
 
 ### `cleanup`
 
-Removes selected local runtime files and caches from `paperscript/`.
+Removes selected local runtime files and caches, or explicitly reconciles versioned JARs in the server root.
 
 Default behavior:
 
@@ -350,13 +365,19 @@ Default behavior:
 Targets:
 
 - `--downloads`
-  Delete staged downloads and temp files in `downloads/`
+  Delete old download workspace files in `downloads/`
 - `--backups`
-  Clean backup jars
+  Clean legacy top-level backup items while preserving the managed `backups/jars/` archive
 - `--backups --keep N`
   Keep the newest `N` backups and remove older ones
+- `--server-jars`
+  Protect the valid launcher-marked JAR, greatest numeric next-start JAR, and any in-flight launcher rollback JAR, then archive older exact numeric builds for that same version
+- `--server-jars --keep N`
+  Use `N` as the steady-state matching-root limit (minimum `2`); the default is `2`. When last-launched and newest are the same file, only one physical JAR is needed. An active launcher may temporarily add one prior rollback JAR, so the safe transient maximum is normally `3`.
+- `--server-jars --version VERSION`
+  Restrict reconciliation to this version; it must agree with the launch marker target
 - `--all`
-  Clean downloads, backups, metadata cache, `__pycache__`, logs, and JSON state/config together
+  Clean downloads, legacy top-level backups, metadata cache, `__pycache__`, logs, and JSON state/config together. It never implies `--server-jars` and preserves `backups/jars/`.
 - `--metadata-cache`
   Delete cached Paper API metadata in `cache/`
 - `--pycache`
@@ -371,7 +392,9 @@ Confirmation behavior:
 - cleanup explains what will be removed
 - cleanup asks for `y/N` confirmation by default
 - `--yes` skips the prompt
-- `--dry-run` shows what would be deleted without removing anything
+- `--dry-run` lists both root-to-archive moves and exact archive-cap prunes without removing anything
+
+`--server-jars` is fail-closed: it refuses to move anything when the launcher marker is missing, malformed, points outside the server root, identifies a symlink, or names another version. Other Minecraft versions, legacy names, partial downloads, malformed names, symlinks, plugin JARs, and unknown files are never managed.
 
 Examples:
 
@@ -382,6 +405,9 @@ Examples:
 ./paperscript.sh cleanup --backups
 ./paperscript.sh cleanup --metadata-cache
 ./paperscript.sh cleanup --backups --keep 10
+./paperscript.sh cleanup --server-jars --dry-run
+./paperscript.sh cleanup --server-jars --keep 2
+./paperscript.sh cleanup --server-jars --version 26.2 --keep 2
 ./paperscript.sh cleanup --pycache
 ./paperscript.sh cleanup --logs
 ./paperscript.sh cleanup --json
@@ -402,7 +428,7 @@ It can create:
 - `downloads/`
 - `backups/`
 
-It always asks for confirmation unless you use `--yes`.
+It asks before its listed repair actions unless you use `--yes`. PaperScript startup itself may already create target-local config, directories, and log scaffolding.
 
 Examples:
 
@@ -421,7 +447,7 @@ Examples:
 - `--user-agent VALUE`
   Full custom User-Agent header. If omitted, PaperScript uses the built-in default.
 - `--tmux-session NAME`
-  tmux session to use for graceful stop. Defaults to config, `PAPERSCRIPT_TMUX_SESSION`, or `mcserver`.
+  tmux session to display in read-only status. Defaults to config, `PAPERSCRIPT_TMUX_SESSION`, or `mcserver`.
 - `--timeout SECONDS`
   HTTP timeout in seconds. Default comes from `config.json` and is `30` unless changed.
 - `--debug-http`
@@ -431,9 +457,9 @@ Examples:
 - `--yes`
   Accept prompts automatically where it is safe to do so.
 - `--force`
-  Reinstall even if the same build is already present. Most useful with `update`, `stable --download`, `experimental --download`, or `download`.
+  Allow the same build to be selected again. PaperScript still refuses to overwrite an existing JAR whose checksum differs.
 - `--dry-run`
-  Show what would happen without downloading, moving jars, pruning backups, or stopping servers.
+  Show what would happen without downloading, moving jars, or pruning archives.
 - `--quiet`
   Suppress normal console output. Logs still go to `paperscript/logs.log`.
 - `--no-color`
@@ -446,13 +472,7 @@ PaperScript also accepts these global flags after the command, so both styles wo
 ./paperscript.sh stable --download --yes --force
 ```
 
-For cron or scheduled tasks, the safest pattern is usually:
-
-```bash
-./paperscript.sh --yes --quiet update
-```
-
-That keeps the run non-interactive, quiet on stdout, and still logged to `paperscript/logs.log`.
+PaperScript is intended for manual invocation. This project does not recommend cron or unattended staging.
 
 For API troubleshooting, a good pattern is:
 
@@ -486,7 +506,7 @@ python3 paperscript.py update
 
 ## Running Server Detection
 
-If `server.properties` exists, PaperScript assumes the directory may be a live server directory and checks for a likely matching Java process.
+If `server.properties` exists, `status` treats the directory as a possible live server and performs read-only checks for a likely matching Java process.
 
 It first uses the `server-port` value from `server.properties` and looks for a Java process listening on that exact TCP port. That makes it safer on a machine that runs several Minecraft servers at once.
 
@@ -496,26 +516,13 @@ If port-based detection does not find anything, it falls back to:
 - command-line matching
 - working-directory matching
 
-When it finds one, it offers:
-
-- graceful stop
-- force stop
-- upgrade anyway
-- exit
-
-Graceful stop behavior:
-
-- first tries `tmux send-keys -t <session> stop Enter`
-- then waits for exit
-- if that fails, falls back to `SIGTERM`
-
-Force stop uses `SIGKILL`.
+Detection never controls that process. Staging does not run a stop command, send tmux keys, send Unix signals, start Java, or restart a tmux session. Stop the server manually through your normal CLI/tmux workflow when you are ready, then run `1MB-minecraft.sh`; it will select the greatest numeric build for its configured version.
 
 Examples:
 
 ```bash
-./paperscript.sh --tmux-session production update
-PAPERSCRIPT_TMUX_SESSION=test-server ./paperscript.sh update
+./paperscript.sh --tmux-session production status
+PAPERSCRIPT_TMUX_SESSION=test-server ./paperscript.sh status
 ```
 
 ## Logging And Runtime Files
@@ -527,19 +534,25 @@ PaperScript stores its runtime files inside the visible `paperscript/` directory
 - `paperscript/config.json`
   Local per-server config, intentionally ignored by git
 - `paperscript/state.json`
-  Last installed jar information, intentionally ignored by git
+  Last staged jar information, intentionally ignored by git
+- `paperscript/last-launched-jar.txt`
+  Exact basename selected by the customized `1MB-minecraft.sh`, written atomically immediately before Java starts; a nonzero JVM exit restores the previous valid marker
 - `paperscript/logs.log`
   Activity log
 - `paperscript/downloads/`
-  Temporary and staged downloads
+  Legacy/diagnostic download workspace; active staging uses a unique hidden temp file on the server filesystem
 - `paperscript/cache/`
   Cached Paper API metadata used to speed up repeated checks
-- `paperscript/backups/`
-  Previous jars moved out of the server root
+- `paperscript/backups/jars/<version>/`
+  Bounded archive of older exact numeric Paper builds moved out of the server root
+- `paperscript/locks/`
+  Per-server advisory staging/cleanup lock plus the fail-closed active-launch guard
 - `paperscript/todo.log`
   Deferred future ideas for the project
 
-These runtime files are isolated on purpose so the server root stays clean and different servers can keep different local settings without git noise.
+These runtime files are isolated on purpose so the server root stays clean and different `--server-dir` targets keep separate config, state, cache, logs, archive, marker, and lock files without git noise.
+
+If an older central checkout kept `config.json` or `state.json` beside `paperscript.py`, the first run against a separate `--server-dir` prints a migration warning and leaves those legacy files untouched. Review and manually copy only the settings/state that belong to that target; PaperScript does not guess which server shared legacy state belongs to.
 
 ## Config Defaults
 
@@ -555,15 +568,13 @@ Current default config:
   "tmux_session": "mcserver",
   "default_channel": "STABLE",
   "check_latest_channel_only": "STABLE",
-  "allow_cross_version_auto_upgrade": false,
   "allow_same_version_build_upgrade": true,
   "keep_backups": 10,
-  "cleanup_backups_after_install": true,
-  "running_server_action": "ask",
-  "graceful_stop_command": "stop",
+  "keep_server_jars": 2,
+  "keep_archived_jars": 5,
+  "reconcile_server_jars_after_stage": true,
   "http_timeout_seconds": 30,
   "status_show_all_channels": true,
-  "download_filename_pattern": "Paper-{version}-{build}.jar",
   "log_file": "logs.log",
   "backup_dir": "backups",
   "downloads_dir": "downloads",
@@ -593,21 +604,23 @@ Useful per-server settings:
 - `server_name`
   Friendly label for status output
 - `tmux_session`
-  Session to use for graceful stop
+  Session to display in read-only status
 - `keep_backups`
-  How many backup jars to keep after install
-- `running_server_action`
-  Default behavior when a running server is detected
+  Retention for historical files in the legacy top-level `backups/` cleanup target
+- `keep_server_jars`
+  Steady-state exact same-version numeric JAR limit (minimum `2`): valid last-launched plus greatest numeric next-start JAR. One in-flight launcher rollback JAR may temporarily exceed it.
+- `keep_archived_jars`
+  Maximum exact numeric Paper JARs retained per version under `paperscript/backups/jars/` (minimum `1`)
+- `reconcile_server_jars_after_stage`
+  Archive older matching root JARs after a successful stage, but only when launcher identity validates
 - `default_channel`
   Default download channel for `download --version`
 - `metadata_cache_enabled`
   Enable or disable the local Paper API metadata cache
 - `metadata_cache_ttl_seconds`
   How long cached metadata stays valid before PaperScript refreshes it
-- `download_filename_pattern`
-  Controls the installed jar name, for example `Paper-{version}-{build}.jar` or `Paper-{version}.jar`
 - `quiet`
-  Make unattended runs silent by default
+  Suppress normal console output while retaining the activity log
 - `no_color`
   Disable ANSI colors by default
 - `color_theme`
@@ -631,7 +644,7 @@ Useful per-server settings:
 
 ## Force Re-Downloading A Build
 
-If you already have a jar installed but want the same file again anyway, use one of these:
+If a build is already selected and you want PaperScript to re-check that request, use one of these:
 
 ```bash
 ./paperscript.sh --force update
@@ -647,11 +660,11 @@ Inside `inspect` and `explore`, PaperScript can also offer:
 Download it anyway? [y/N]
 ```
 
-when the selected build is already installed.
+when the selected build is already staged. An existing target is kept byte-for-byte and is only accepted when its checksum matches the Paper API.
 
 ## Example Workflows
 
-Check a live server without changing anything:
+Check a live server without changing server JARs or controlling its lifecycle:
 
 ```bash
 ./paperscript.sh status
@@ -659,7 +672,7 @@ Check a live server without changing anything:
 ./paperscript.sh update --dry-run
 ```
 
-Update a dev server in the current directory:
+Stage a newer build for a dev server in the current directory:
 
 ```bash
 ./paperscript.sh update
@@ -704,10 +717,16 @@ For the configured `_minecraftVersion`, the customized launcher:
 - prefers `Paper-<version>-<numeric-build>.jar`
 - compares build numbers numerically and selects the greatest build
 - ignores other Minecraft versions, partial downloads, and malformed build names
+- ignores symlink JAR candidates
 - falls back to the legacy `paper-<version>.jar` name when no versioned build exists
+- writes the exact selected basename atomically to `paperscript/last-launched-jar.txt` before invoking Java
+- resolves and enters its own directory first, so launching it from another working directory cannot select another server's JAR
+- keeps a fail-closed launch lock for the JVM lifetime, refuses overlapping launches, and restores the prior valid marker when Java returns an error
 
 The launcher only chooses a jar when the server is started. It does not download jars,
 stop a running server, or modify the external canonical 1MB source.
+
+The launcher never guesses that an abandoned launch lock is stale: the wrapper can die while Java remains alive. If `paperscript/locks/server-launch/` remains after a crash, first confirm that the Minecraft JVM is fully stopped, then remove only that lock directory before retrying the launcher.
 
 ## Testing
 
@@ -721,7 +740,7 @@ bash -n paperscript.sh 1MB-minecraft.sh tests/live-smoke.sh
 python3 -m py_compile paperscript/paperscript.py tests/test_paperscript.py tests/test_1mb_minecraft.py
 ```
 
-The unit suite verifies version ordering, stable-channel defaults, same-version build-upgrade behavior, preview selection, both supported PaperScript jar naming styles, saved channel metadata, agreement between runtime, tracked, and documented config defaults, and the customized 1MB launcher's numeric latest-build selection. Launcher tests use a disposable fake `java` executable and never start a real server.
+The unit suite verifies version ordering, stable-channel defaults, same-version build-upgrade behavior, preview selection, saved channel metadata, atomic state/config defaults, launcher marker publication and rollback, numeric latest-build selection, non-disruptive staging, per-server and active-launch locking, fail-closed marker handling, symlink/version containment, dry-run pruning previews, root retention, and archive caps. Launcher tests use a disposable fake `java` executable and never start a real server.
 
 Run the opt-in live PaperMC smoke test:
 
@@ -729,7 +748,7 @@ Run the opt-in live PaperMC smoke test:
 ./tests/live-smoke.sh
 ```
 
-The live test creates a temporary server root, uses `STABLE` for both release checks, enables same-version build upgrades, and deliberately uses the per-server compatibility pattern `Paper-{version}.jar`. It then downloads the latest stable Paper release, verifies its SHA-256, confirms `status` detects its version/build/channel/path, and runs `verify`. The temporary jar and runtime files are removed afterward.
+The live test creates a temporary server root, uses `STABLE` for both release checks, stages the canonical `Paper-{version}-{build}.jar`, verifies its SHA-256, confirms `status` detects its version/build/channel/path, and runs `verify`. It never starts or stops a server. The temporary jar and runtime files are removed afterward.
 
 To retain the disposable directory for troubleshooting:
 
@@ -743,11 +762,10 @@ GitHub Actions runs the network-free unit and syntax checks on current macOS and
 
 PaperScript keeps a live local todo file at [paperscript/todo.log](./paperscript/todo.log) for deferred ideas that are not implemented yet.
 
-Current queued ideas include:
+Current completed production foundations include manual non-disruptive staging, per-server locking, atomic staged publication/state, bounded JAR retention, and latest-build launcher selection with an active marker. Remaining queued ideas include:
 
-- manual, non-disruptive staging of versioned Paper jars without stopping the server
-- transactional downloads, per-server locking, atomic state, and path containment
-- latest-build selection in the canonical `1MB-minecraft.sh` for the configured Minecraft version
+- metadata-cache durability and corrupt-cache diagnostics
+- manual review/application of the launcher diff to the canonical `1MB-minecraft.sh`
 - read-only doctor checks, actionable verification results, and machine-readable status
 - broader failure-injection, CLI integration, and launcher compatibility tests
 

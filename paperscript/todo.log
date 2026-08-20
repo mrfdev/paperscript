@@ -2,30 +2,31 @@ PaperScript production todo
 
 Product direction and boundaries
 
-- [ ] Keep PaperScript manually invoked. Remove cron, scheduling, and unattended-update recommendations.
-- [ ] Make update a non-disruptive staging operation: download and verify a new
+- [x] Keep PaperScript manually invoked. Remove cron, scheduling, and unattended-update recommendations.
+- [x] Make update a non-disruptive staging operation: download and verify a new
       Paper-<version>-<build>.jar beside the active jar while the server keeps running.
       PaperScript must not stop, kill, start, or restart the server, and must not replace
       the jar currently in use.
-- [ ] Keep tmux lifecycle control manual and external to PaperScript. PaperScript may use
+- [x] Keep tmux lifecycle control manual and external to PaperScript. PaperScript may use
       tmux information for read-only status and doctor checks, but update must not send
       stop or start commands.
-- [ ] Keep full server, world, plugin, and BlueMap backup orchestration separate. A quick
+- [x] Keep full server, world, plugin, and BlueMap backup orchestration separate. A quick
       Paper jar download must not wait for hundreds of gigabytes of backup work. Limit
       PaperScript itself to safe jar retention and cleanup.
 
 Safe jar staging
 
-- [ ] Add a per-server exclusive lock so overlapping manual runs cannot share, remove,
+- [x] Add a per-server exclusive lock so overlapping manual runs cannot share, remove,
       or overwrite each other's staged downloads or state.
 - [ ] Make staging transactional: preflight disk space and permissions, download to a
       unique temporary file, require the Paper API SHA-256, verify size and jar structure,
       fsync, then atomically rename to Paper-<version>-<build>.jar.
-- [ ] Write config, state, and metadata cache atomically with temp files, fsync, and
-      os.replace; preserve and report corrupt JSON instead of silently replacing it.
-- [ ] Validate and contain every configured path. Reject filesystem roots, traversal,
+- [x] Write config and state atomically with temp files, fsync, and os.replace; preserve
+      and report corrupt JSON instead of silently replacing it.
+- [ ] Write metadata cache atomically and preserve a corrupt cache for diagnosis.
+- [x] Validate and contain every configured path. Reject filesystem roots, traversal,
       unsafe symlinks, and jar filename patterns that are not plain .jar basenames.
-- [ ] Namespace runtime state and locks by canonical server directory so one PaperScript
+- [x] Namespace runtime state and locks by canonical server directory so one PaperScript
       checkout can safely target more than one server.
 
 1MB-minecraft.sh integration
@@ -40,9 +41,24 @@ Safe jar staging
       lexicographic build ordering.
 - [x] Add launcher tests for multiple builds, multiple Minecraft versions, legacy fallback,
       malformed names, and build-number boundaries such as 9 versus 10.
+- [x] Record the exact launcher-selected basename atomically before Java starts, resolve
+      the launcher's own directory, ignore symlink jar candidates, hold a fail-closed
+      launch lock for the JVM lifetime, and restore the prior marker on JVM failure.
 - [ ] Manually review and apply the test-instance launcher diff at its canonical source,
       then propagate it through the normal 1MB-minecraft.sh release/update flow rather than
       editing every generated server copy.
+
+Bounded Paper jar retention
+
+- [x] Keep the valid last-launched jar plus the newest staged same-version jar in the
+      server root by default; temporarily protect one in-flight launcher rollback jar;
+      never infer or move an active jar without a valid marker.
+- [x] Archive only exact regular non-symlink Paper-<version>-<numeric-build>.jar files for
+      the marker version under paperscript/backups/jars/<version>/ and cap that archive.
+- [x] Add explicit cleanup --server-jars with confirmation, --keep, --version, and dry-run;
+      keep it out of cleanup --all and preserve the old cleanup --keep backup behavior.
+- [x] Add adversarial tests for numeric ordering, versions, malformed names, symlinks,
+      invalid markers, archive caps, lock contention, and active-jar byte/inode stability.
 
 Validation and operator feedback
 
