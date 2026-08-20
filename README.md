@@ -693,6 +693,22 @@ Target a separate server directory:
 ./paperscript.sh --server-dir /Users/you/minecraft/test-server update
 ```
 
+## Test-Instance 1MB Launcher
+
+This repository includes a customized test-instance copy of `1MB-minecraft.sh` at the
+server root. The copy records the SHA-256 of the original launcher it came from so its
+changes can be reviewed and manually applied to the canonical 1MB source later.
+
+For the configured `_minecraftVersion`, the customized launcher:
+
+- prefers `Paper-<version>-<numeric-build>.jar`
+- compares build numbers numerically and selects the greatest build
+- ignores other Minecraft versions, partial downloads, and malformed build names
+- falls back to the legacy `paper-<version>.jar` name when no versioned build exists
+
+The launcher only chooses a jar when the server is started. It does not download jars,
+stop a running server, or modify the external canonical 1MB source.
+
 ## Testing
 
 PaperScript does not keep a Minecraft server, world, plugin directory, or reusable server template in this repository. Those files would be large, environment-specific, and too easy to mix with production data. Tests use disposable server directories instead.
@@ -701,11 +717,11 @@ Run the dependency-free unit and drift checks:
 
 ```bash
 python3 -m unittest discover -s tests -p 'test_*.py' -v
-bash -n paperscript.sh tests/live-smoke.sh
-python3 -m py_compile paperscript/paperscript.py tests/test_paperscript.py
+bash -n paperscript.sh 1MB-minecraft.sh tests/live-smoke.sh
+python3 -m py_compile paperscript/paperscript.py tests/test_paperscript.py tests/test_1mb_minecraft.py
 ```
 
-The unit suite verifies version ordering, stable-channel defaults, same-version build-upgrade behavior, preview selection, both supported jar naming styles, saved channel metadata, and agreement between runtime, tracked, and documented config defaults.
+The unit suite verifies version ordering, stable-channel defaults, same-version build-upgrade behavior, preview selection, both supported PaperScript jar naming styles, saved channel metadata, agreement between runtime, tracked, and documented config defaults, and the customized 1MB launcher's numeric latest-build selection. Launcher tests use a disposable fake `java` executable and never start a real server.
 
 Run the opt-in live PaperMC smoke test:
 

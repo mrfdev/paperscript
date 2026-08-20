@@ -30,16 +30,19 @@ Safe jar staging
 
 1MB-minecraft.sh integration
 
-- [ ] Update the canonical 1MB-minecraft.sh so, for its configured Minecraft version, it
+- [x] Copy the latest canonical 1MB-minecraft.sh into the disposable PaperScript test
+      instance and record its original SHA-256 for later manual comparison.
+- [x] Customize the test-instance copy so, for its configured Minecraft version, it
       recognizes Paper-<version>-<numeric-build>.jar and selects the greatest numeric build
       on the next manual start. Never select a jar from another Minecraft version.
-- [ ] Preserve compatibility with the existing paper-<version>.jar naming fallback, ignore
+- [x] Preserve compatibility with the existing paper-<version>.jar naming fallback, ignore
       .part and malformed files, handle case consistently, and use numeric rather than
       lexicographic build ordering.
-- [ ] Add launcher tests for multiple builds, multiple Minecraft versions, legacy fallback,
+- [x] Add launcher tests for multiple builds, multiple Minecraft versions, legacy fallback,
       malformed names, and build-number boundaries such as 9 versus 10.
-- [ ] Apply the launcher change at its canonical source and propagate it through the normal
-      1MB-minecraft.sh release/update flow rather than editing every generated server copy.
+- [ ] Manually review and apply the test-instance launcher diff at its canonical source,
+      then propagate it through the normal 1MB-minecraft.sh release/update flow rather than
+      editing every generated server copy.
 
 Validation and operator feedback
 
