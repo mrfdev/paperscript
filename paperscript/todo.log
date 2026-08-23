@@ -18,9 +18,11 @@ Safe jar staging
 
 - [x] Add a per-server exclusive lock so overlapping manual runs cannot share, remove,
       or overwrite each other's staged downloads or state.
-- [ ] Make staging transactional: preflight disk space and permissions, download to a
-      unique temporary file, require the Paper API SHA-256, verify size and jar structure,
-      fsync, then atomically rename to Paper-<version>-<build>.jar.
+- [x] Make staging transactional: require Paper API size and SHA-256, preflight server-root
+      write access, durable directory sync, and free-space reserve; stream into one private
+      same-filesystem inode without exceeding the declared size; verify on-disk size,
+      SHA-256, executable JAR structure, and every ZIP CRC; fsync; then atomically publish
+      Paper-<version>-<build>.jar without overwriting an existing path.
 - [x] Write config and state atomically with temp files, fsync, and os.replace; preserve
       and report corrupt JSON instead of silently replacing it.
 - [ ] Write metadata cache atomically and preserve a corrupt cache for diagnosis.

@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import argparse
 import importlib.util
+import io
 import json
 import re
 import sys
 import tempfile
 import unittest
+import zipfile
 from pathlib import Path
 from unittest import mock
 
@@ -38,12 +40,115 @@ def build_info(
     )
 
 
+def executable_jar_bytes(payload: bytes = b"fixture") -> bytes:
+    output = io.BytesIO()
+    with zipfile.ZipFile(output, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr(
+            "META-INF/MANIFEST.MF",
+            "Manifest-Version: 1.0\r\nMain-Class: io.papermc.paperclip.Main\r\n\r\n",
+        )
+        archive.writestr(
+            "io/papermc/paperclip/Main.class",
+            b"\xca\xfe\xba\xbe" + payload,
+        )
+        archive.writestr("version.json", b"{}")
+    return output.getvalue()
+
+
 class RecordingLogger:
     def __init__(self) -> None:
         self.messages: list[str] = []
 
     def log(self, message: str) -> None:
         self.messages.append(message)
+
+
+class ByteResponse:
+    def __init__(self, content: bytes) -> None:
+        self.stream = io.BytesIO(content)
+
+    def __enter__(self) -> "ByteResponse":
+        return self
+
+    def __exit__(self, exc_type: object, exc_value: object, traceback: object) -> None:
+        return None
+
+    def read(self, size: int = -1) -> bytes:
+        return self.stream.read(size)
+
+
+class PaperAPIDownloadSafetyTests(unittest.TestCase):
+    def make_api(self, retries: int = 0) -> paperscript.PaperAPI:
+        return paperscript.PaperAPI(
+            "test-agent/1.0 (https://example.invalid)",
+            retries=retries,
+            retry_backoff_seconds=0,
+            cache_enabled=False,
+        )
+
+    def test_download_never_writes_beyond_api_declared_size(self) -> None:
+        content = b"four"
+        build = build_info()
+        build.size = len(content) - 1
+        build.sha256 = paperscript.hashlib.sha256(content[: build.size]).hexdigest()
+        with tempfile.TemporaryDirectory() as directory:
+            destination = Path(directory) / "private.part"
+            destination.write_bytes(b"")
+
+            with mock.patch.object(paperscript, "urlopen", return_value=ByteResponse(content)):
+                with self.assertRaisesRegex(paperscript.PaperScriptError, "exceeded"):
+                    self.make_api().download_file(build, destination)
+
+            self.assertEqual(destination.stat().st_size, 0)
+
+    def test_transient_retry_preserves_precreated_private_inode(self) -> None:
+        content = b"retried bytes"
+        build = build_info()
+        build.size = len(content)
+        build.sha256 = paperscript.hashlib.sha256(content).hexdigest()
+        with tempfile.TemporaryDirectory() as directory:
+            destination = Path(directory) / "private.part"
+            destination.write_bytes(b"")
+            before = destination.stat()
+
+            with mock.patch.object(
+                paperscript,
+                "urlopen",
+                side_effect=[paperscript.URLError("temporary"), ByteResponse(content)],
+            ):
+                verification = self.make_api(retries=1).download_file(build, destination)
+
+            after = destination.stat()
+            self.assertEqual((after.st_dev, after.st_ino), (before.st_dev, before.st_ino))
+            self.assertEqual(destination.read_bytes(), content)
+            self.assertEqual(verification.bytes_written, len(content))
+
+    def test_descriptor_download_cannot_be_redirected_by_path_replacement(self) -> None:
+        content = b"descriptor bytes"
+        build = build_info()
+        build.size = len(content)
+        build.sha256 = paperscript.hashlib.sha256(content).hexdigest()
+        with tempfile.TemporaryDirectory() as directory:
+            destination = Path(directory) / "private.part"
+            destination.write_bytes(b"")
+            descriptor = paperscript.os.open(destination, paperscript.os.O_RDWR)
+            try:
+                destination.unlink()
+                destination.write_bytes(b"replacement sentinel")
+
+                with mock.patch.object(paperscript, "urlopen", return_value=ByteResponse(content)):
+                    verification = self.make_api().download_file(
+                        build,
+                        destination,
+                        descriptor,
+                    )
+
+                paperscript.os.lseek(descriptor, 0, paperscript.os.SEEK_SET)
+                self.assertEqual(paperscript.os.read(descriptor, len(content)), content)
+                self.assertEqual(destination.read_bytes(), b"replacement sentinel")
+                self.assertEqual(verification.sha256, build.sha256)
+            finally:
+                paperscript.os.close(descriptor)
 
 
 class ReleaseAndConfigTests(unittest.TestCase):
@@ -788,6 +893,7 @@ class NonDisruptiveStagingTests(unittest.TestCase):
                 self,
                 selected: paperscript.BuildInfo,
                 destination: Path,
+                destination_descriptor: int | None = None,
             ) -> paperscript.DownloadVerification:
                 destination.write_bytes(content)
                 return paperscript.DownloadVerification(
@@ -801,7 +907,11 @@ class NonDisruptiveStagingTests(unittest.TestCase):
 
     def test_stages_beside_active_jar_without_changing_it(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            app, build = self.make_app(directory, b"verified new paper jar", "Paper-26.2-9.jar")
+            app, build = self.make_app(
+                directory,
+                executable_jar_bytes(b"verified new paper jar"),
+                "Paper-26.2-9.jar",
+            )
             active = app.server_dir / "Paper-26.2-9.jar"
             old_staged = app.server_dir / "Paper-26.2-10.jar"
             active.write_bytes(b"active paper jar")
@@ -815,7 +925,9 @@ class NonDisruptiveStagingTests(unittest.TestCase):
             active_after = active.stat()
             self.assertEqual(active_before.st_ino, active_after.st_ino)
             self.assertEqual(active_before.st_mtime_ns, active_after.st_mtime_ns)
-            self.assertTrue((app.server_dir / "Paper-26.2-11.jar").is_file())
+            staged = app.server_dir / "Paper-26.2-11.jar"
+            self.assertTrue(staged.is_file())
+            self.assertEqual(staged.stat().st_mode & 0o777, 0o644)
             self.assertFalse(old_staged.exists())
             self.assertTrue(
                 (app.jar_archive_dir / "26.2" / old_staged.name).is_file()
@@ -829,7 +941,7 @@ class NonDisruptiveStagingTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             app, build = self.make_app(
                 directory,
-                b"verified new paper jar",
+                executable_jar_bytes(b"verified new paper jar"),
                 "Paper-26.2-9.jar",
             )
             (app.server_dir / "Paper-26.2-9.jar").write_bytes(b"active")
@@ -845,7 +957,11 @@ class NonDisruptiveStagingTests(unittest.TestCase):
 
     def test_missing_launcher_marker_stages_but_defers_root_cleanup(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            app, build = self.make_app(directory, b"verified new paper jar", marker=None)
+            app, build = self.make_app(
+                directory,
+                executable_jar_bytes(b"verified new paper jar"),
+                marker=None,
+            )
             old_names = ["Paper-26.2-9.jar", "Paper-26.2-10.jar"]
             for name in old_names:
                 (app.server_dir / name).write_bytes(name.encode())
@@ -861,7 +977,7 @@ class NonDisruptiveStagingTests(unittest.TestCase):
 
     def test_target_appearing_during_download_is_never_overwritten(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            content = b"verified new paper jar"
+            content = executable_jar_bytes(b"verified new paper jar")
             app, build = self.make_app(directory, content, marker=None)
             target = app.server_dir / "Paper-26.2-11.jar"
 
@@ -870,6 +986,7 @@ class NonDisruptiveStagingTests(unittest.TestCase):
                     self,
                     selected: paperscript.BuildInfo,
                     destination: Path,
+                    destination_descriptor: int | None = None,
                 ) -> paperscript.DownloadVerification:
                     destination.write_bytes(content)
                     target.write_bytes(b"concurrent sentinel")
@@ -887,9 +1004,9 @@ class NonDisruptiveStagingTests(unittest.TestCase):
             self.assertEqual(target.read_bytes(), b"concurrent sentinel")
 
     def test_failed_verification_removes_temporary_downloads(self) -> None:
-        for failure in ("missing_sha", "size", "checksum"):
+        for failure in ("missing_sha", "missing_size", "size", "checksum"):
             with self.subTest(failure=failure), tempfile.TemporaryDirectory() as directory:
-                content = b"downloaded paper bytes"
+                content = executable_jar_bytes(b"downloaded paper bytes")
                 app, build = self.make_app(
                     directory,
                     content,
@@ -899,6 +1016,8 @@ class NonDisruptiveStagingTests(unittest.TestCase):
                 active.write_bytes(b"active")
                 if failure == "missing_sha":
                     build.sha256 = None
+                elif failure == "missing_size":
+                    build.size = None
                 else:
                     expected_sha = build.sha256 or ""
 
@@ -907,6 +1026,7 @@ class NonDisruptiveStagingTests(unittest.TestCase):
                             self,
                             selected: paperscript.BuildInfo,
                             destination: Path,
+                            destination_descriptor: int | None = None,
                         ) -> paperscript.DownloadVerification:
                             destination.write_bytes(content)
                             return paperscript.DownloadVerification(
@@ -924,11 +1044,160 @@ class NonDisruptiveStagingTests(unittest.TestCase):
                 self.assertFalse((app.server_dir / "Paper-26.2-11.jar").exists())
                 self.assertEqual(list(app.server_dir.glob(".*.part")), [])
 
+    def test_preflight_refuses_insufficient_space_before_download(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            app, build = self.make_app(
+                directory,
+                executable_jar_bytes(b"space preflight"),
+                "Paper-26.2-9.jar",
+            )
+            (app.server_dir / "Paper-26.2-9.jar").write_bytes(b"active")
+            available = (build.size or 0) + paperscript.STAGING_FREE_SPACE_RESERVE_BYTES - 1
+
+            with mock.patch.object(
+                paperscript.shutil,
+                "disk_usage",
+                return_value=mock.Mock(free=available),
+            ), mock.patch.object(app.api, "download_file") as download:
+                with self.assertRaisesRegex(paperscript.PaperScriptError, "No download was started"):
+                    app.stage_build(build)
+
+            download.assert_not_called()
+            self.assertFalse((app.server_dir / "Paper-26.2-11.jar").exists())
+            self.assertEqual(list(app.server_dir.glob(".*.part")), [])
+
+    def test_preflight_refuses_missing_server_root_write_access_before_download(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            app, build = self.make_app(
+                directory,
+                executable_jar_bytes(b"permission preflight"),
+                "Paper-26.2-9.jar",
+            )
+            (app.server_dir / "Paper-26.2-9.jar").write_bytes(b"active")
+
+            with mock.patch.object(
+                paperscript.tempfile,
+                "mkstemp",
+                side_effect=PermissionError("simulated read-only server root"),
+            ), mock.patch.object(app.api, "download_file") as download:
+                with self.assertRaisesRegex(paperscript.PaperScriptError, "Staging preflight"):
+                    app.stage_build(build)
+
+            download.assert_not_called()
+            self.assertFalse((app.server_dir / "Paper-26.2-11.jar").exists())
+
+    def test_preflight_refuses_unsupported_durable_directory_sync_before_download(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            app, build = self.make_app(
+                directory,
+                executable_jar_bytes(b"directory sync preflight"),
+                "Paper-26.2-9.jar",
+            )
+            (app.server_dir / "Paper-26.2-9.jar").write_bytes(b"active")
+
+            with mock.patch.object(
+                paperscript,
+                "fsync_directory",
+                side_effect=paperscript.PaperScriptError("simulated unsupported directory sync"),
+            ), mock.patch.object(app.api, "download_file") as download:
+                with self.assertRaisesRegex(paperscript.PaperScriptError, "unsupported directory sync"):
+                    app.stage_build(build)
+
+            download.assert_not_called()
+            self.assertFalse((app.server_dir / "Paper-26.2-11.jar").exists())
+            self.assertEqual(list(app.server_dir.glob(".*.part")), [])
+
+    def test_non_executable_or_corrupt_archives_are_never_published(self) -> None:
+        archive_without_manifest = io.BytesIO()
+        with zipfile.ZipFile(archive_without_manifest, "w") as archive:
+            archive.writestr("example/Main.class", b"\xca\xfe\xba\xbe")
+
+        archive_with_invalid_class = io.BytesIO()
+        with zipfile.ZipFile(archive_with_invalid_class, "w") as archive:
+            archive.writestr(
+                "META-INF/MANIFEST.MF",
+                "Manifest-Version: 1.0\r\nMain-Class: example.Main\r\n\r\n",
+            )
+            archive.writestr("example/Main.class", b"not-a-class")
+
+        valid_archive = executable_jar_bytes(b"truncate me")
+        invalid_contents = (
+            b"not a zip archive",
+            archive_without_manifest.getvalue(),
+            archive_with_invalid_class.getvalue(),
+            valid_archive[:-12],
+        )
+        for content in invalid_contents:
+            with self.subTest(size=len(content)), tempfile.TemporaryDirectory() as directory:
+                app, build = self.make_app(directory, content, "Paper-26.2-9.jar")
+                active = app.server_dir / "Paper-26.2-9.jar"
+                active.write_bytes(b"active")
+
+                with self.assertRaises(paperscript.PaperScriptError):
+                    app.stage_build(build)
+
+                self.assertEqual(active.read_bytes(), b"active")
+                self.assertFalse((app.server_dir / "Paper-26.2-11.jar").exists())
+                self.assertEqual(list(app.server_dir.glob(".*.part")), [])
+
+    def test_replaced_private_staging_path_is_rejected_without_publishing(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            content = executable_jar_bytes(b"replacement race")
+            app, build = self.make_app(directory, content, "Paper-26.2-9.jar")
+            active = app.server_dir / "Paper-26.2-9.jar"
+            active.write_bytes(b"active")
+
+            class ReplacingAPI:
+                def download_file(
+                    self,
+                    selected: paperscript.BuildInfo,
+                    destination: Path,
+                    destination_descriptor: int | None = None,
+                ) -> paperscript.DownloadVerification:
+                    destination.unlink()
+                    destination.write_bytes(content)
+                    return paperscript.DownloadVerification(
+                        sha256=selected.sha256 or "",
+                        bytes_written=len(content),
+                        elapsed_seconds=0.01,
+                    )
+
+            app.api = ReplacingAPI()
+            with self.assertRaisesRegex(paperscript.PaperScriptError, "private regular file"):
+                app.stage_build(build)
+
+            self.assertEqual(active.read_bytes(), b"active")
+            self.assertFalse((app.server_dir / "Paper-26.2-11.jar").exists())
+            changed_paths = list(app.server_dir.glob(".*.part"))
+            self.assertEqual(len(changed_paths), 1)
+            changed_paths[0].unlink()
+
+    def test_final_directory_sync_failure_never_exposes_partial_bytes(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            content = executable_jar_bytes(b"durable publish")
+            app, build = self.make_app(directory, content, "Paper-26.2-9.jar")
+            active = app.server_dir / "Paper-26.2-9.jar"
+            active.write_bytes(b"active")
+
+            with mock.patch.object(
+                paperscript,
+                "fsync_directory",
+                side_effect=[None, paperscript.PaperScriptError("simulated final sync failure")],
+            ):
+                with self.assertRaisesRegex(paperscript.PaperScriptError, "final sync failure"):
+                    app.stage_build(build)
+
+            target = app.server_dir / "Paper-26.2-11.jar"
+            self.assertEqual(target.read_bytes(), content)
+            self.assertEqual(active.read_bytes(), b"active")
+            self.assertEqual(app.state, {})
+            self.assertEqual(list(app.server_dir.glob(".*.part")), [])
+
     def test_partial_download_exception_is_normalized_and_cleans_temp_state(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             app, build = self.make_app(
                 directory,
-                b"unused",
+                executable_jar_bytes(b"unused"),
                 "Paper-26.2-9.jar",
             )
             active = app.server_dir / "Paper-26.2-9.jar"
@@ -939,6 +1208,7 @@ class NonDisruptiveStagingTests(unittest.TestCase):
                     self,
                     selected: paperscript.BuildInfo,
                     destination: Path,
+                    destination_descriptor: int | None = None,
                 ) -> paperscript.DownloadVerification:
                     destination.write_bytes(b"partial")
                     raise OSError("simulated disk or stream failure")
@@ -957,7 +1227,7 @@ class NonDisruptiveStagingTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             app, build = self.make_app(
                 directory,
-                b"older build",
+                executable_jar_bytes(b"older build"),
                 "Paper-26.2-9.jar",
             )
             (app.server_dir / "Paper-26.2-9.jar").write_bytes(b"active")
@@ -977,7 +1247,7 @@ class NonDisruptiveStagingTests(unittest.TestCase):
 
     def test_force_redownload_verifies_without_replacing_existing_target(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            content = b"verified existing paper jar"
+            content = executable_jar_bytes(b"verified existing paper jar")
             app, build = self.make_app(directory, content, "Paper-26.2-11.jar")
             target = app.server_dir / "Paper-26.2-11.jar"
             target.write_bytes(content)
@@ -992,6 +1262,24 @@ class NonDisruptiveStagingTests(unittest.TestCase):
             self.assertTrue(
                 any("Re-downloaded and verified" in message for message in app.logger.messages)
             )
+
+    def test_existing_target_with_matching_metadata_but_invalid_jar_is_never_replaced(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            content = b"not an executable jar"
+            app, build = self.make_app(directory, content, "Paper-26.2-11.jar")
+            target = app.server_dir / "Paper-26.2-11.jar"
+            target.write_bytes(content)
+            before = target.stat()
+            app.args.force = True
+
+            with mock.patch.object(app.api, "download_file") as download:
+                with self.assertRaisesRegex(paperscript.PaperScriptError, "failed exact Paper artifact"):
+                    app.stage_build(build)
+
+            download.assert_not_called()
+            after = target.stat()
+            self.assertEqual((after.st_ino, after.st_mtime_ns), (before.st_ino, before.st_mtime_ns))
+            self.assertEqual(target.read_bytes(), content)
 
 
 class CleanupSelectionCompatibilityTests(unittest.TestCase):

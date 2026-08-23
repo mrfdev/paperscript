@@ -17,6 +17,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import zipfile
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -27,8 +28,8 @@ from urllib.request import Request, urlopen
 
 
 APP_NAME = "PaperScript"
-APP_VERSION = "5.1.0"
-APP_BUILD = "051"
+APP_VERSION = "5.2.0"
+APP_BUILD = "052"
 APP_RELEASE = f"{APP_VERSION} build {APP_BUILD}"
 API_ROOT = "https://fill.papermc.io/v3/projects/paper"
 PROJECT_URL = "https://github.com/mrfdev/PaperScript"
@@ -37,6 +38,9 @@ DEFAULT_CHANNEL = "STABLE"
 DEFAULT_TIMEOUT = 30
 DEFAULT_USER_AGENT = f"mrfloris-PaperScript/2.0 ({PROJECT_URL})"
 TRANSIENT_HTTP_CODES = {429, 500, 502, 503, 504, 520, 521, 522, 523, 524}
+STAGING_FREE_SPACE_RESERVE_BYTES = 64 * 1024 * 1024
+MAX_JAR_MANIFEST_BYTES = 1024 * 1024
+JAR_MANIFEST_PATH = "META-INF/MANIFEST.MF"
 COMMAND_NAMES = {
     "update",
     "status",
@@ -121,9 +125,11 @@ Safe jar staging
 
 - [x] Add a per-server exclusive lock so overlapping manual runs cannot share, remove,
       or overwrite each other's staged downloads or state.
-- [ ] Make staging transactional: preflight disk space and permissions, download to a
-      unique temporary file, require the Paper API SHA-256, verify size and jar structure,
-      fsync, then atomically rename to Paper-<version>-<build>.jar.
+- [x] Make staging transactional: require Paper API size and SHA-256, preflight server-root
+      write access, durable directory sync, and free-space reserve; stream into one private
+      same-filesystem inode without exceeding the declared size; verify on-disk size,
+      SHA-256, executable JAR structure, and every ZIP CRC; fsync; then atomically publish
+      Paper-<version>-<build>.jar without overwriting an existing path.
 - [x] Write config and state atomically with temp files, fsync, and os.replace; preserve
       and report corrupt JSON instead of silently replacing it.
 - [ ] Write metadata cache atomically and preserve a corrupt cache for diagnosis.
@@ -306,6 +312,14 @@ class DownloadVerification:
     sha256: str
     bytes_written: int
     elapsed_seconds: float
+
+
+@dataclass(frozen=True)
+class ArtifactVerification:
+    sha256: str
+    size: int
+    entry_count: int
+    main_class: str
 
 
 @dataclass(frozen=True)
@@ -607,6 +621,162 @@ def sha256_file(path: Path) -> str:
                 break
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def required_artifact_size(build: BuildInfo) -> int:
+    """Return trustworthy Fill size metadata or refuse to stage the artifact."""
+    if isinstance(build.size, bool) or not isinstance(build.size, int) or build.size <= 0:
+        raise PaperScriptError(
+            f"Paper API did not provide a valid positive size for {build.filename}; staging was refused."
+        )
+    return build.size
+
+
+def require_artifact_metadata(build: BuildInfo) -> int:
+    """Fail closed when Fill omits either field needed for safe staging."""
+    if not isinstance(build.sha256, str) or not re.fullmatch(r"[0-9a-fA-F]{64}", build.sha256):
+        raise PaperScriptError(
+            f"Paper API did not provide a valid SHA-256 for {build.filename}; staging was refused."
+        )
+    return required_artifact_size(build)
+
+
+def sha256_descriptor(descriptor: int) -> str:
+    """Hash the already-open inode so verification cannot follow a replaced path."""
+    digest = hashlib.sha256()
+    with os.fdopen(os.dup(descriptor), "rb") as handle:
+        handle.seek(0)
+        while True:
+            chunk = handle.read(1024 * 1024)
+            if not chunk:
+                break
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def manifest_main_class(payload: bytes) -> str:
+    if len(payload) > MAX_JAR_MANIFEST_BYTES:
+        raise PaperScriptError(
+            f"JAR manifest exceeds the {format_bytes(MAX_JAR_MANIFEST_BYTES)} safety limit."
+        )
+    try:
+        text = payload.decode("utf-8")
+    except UnicodeDecodeError as error:
+        raise PaperScriptError("JAR manifest is not valid UTF-8.") from error
+
+    physical_lines = text.replace("\r\n", "\n").replace("\r", "\n").split("\n")
+    main_section: list[str] = []
+    for line in physical_lines:
+        if line.startswith(" "):
+            if not main_section:
+                raise PaperScriptError("JAR manifest starts with an invalid continuation line.")
+            main_section[-1] += line[1:]
+            continue
+        if not line:
+            break
+        main_section.append(line)
+
+    values: list[str] = []
+    for line in main_section:
+        key, separator, value = line.partition(":")
+        if separator and key.casefold() == "main-class":
+            values.append(value.strip())
+    if len(values) != 1 or not values[0]:
+        raise PaperScriptError("JAR manifest must contain exactly one non-empty Main-Class entry.")
+
+    main_class = values[0]
+    if (
+        any(character.isspace() for character in main_class)
+        or "/" in main_class
+        or "\\" in main_class
+        or main_class.startswith(".")
+        or main_class.endswith(".")
+        or ".." in main_class
+    ):
+        raise PaperScriptError(f"JAR manifest has an unsafe Main-Class value: {main_class!r}.")
+    return main_class
+
+
+def verify_paper_artifact_descriptor(descriptor: int, build: BuildInfo) -> ArtifactVerification:
+    """Verify exact downloaded bytes as an intact executable JAR before publication."""
+    expected_size = required_artifact_size(build)
+    descriptor_stat = os.fstat(descriptor)
+    if not stat.S_ISREG(descriptor_stat.st_mode):
+        raise PaperScriptError(f"Staging file for {build.filename} is no longer a regular file.")
+    if descriptor_stat.st_size != expected_size:
+        raise PaperScriptError(
+            f"Downloaded size mismatch for {build.filename}: expected {expected_size}, "
+            f"got {descriptor_stat.st_size} bytes on disk."
+        )
+
+    digest = sha256_descriptor(descriptor)
+    expected_sha256 = str(build.sha256 or "")
+    if digest.lower() != expected_sha256.lower():
+        raise PaperScriptError(
+            f"Checksum mismatch for {build.filename}: expected {expected_sha256}, got {digest}"
+        )
+
+    try:
+        with os.fdopen(os.dup(descriptor), "rb") as handle:
+            handle.seek(0)
+            with zipfile.ZipFile(handle, "r") as archive:
+                entries = archive.infolist()
+                regular_entries = [entry for entry in entries if not entry.is_dir()]
+                if not regular_entries:
+                    raise PaperScriptError("JAR archive contains no files.")
+
+                manifest_entries = [
+                    entry for entry in entries if entry.filename == JAR_MANIFEST_PATH
+                ]
+                if len(manifest_entries) != 1 or manifest_entries[0].is_dir():
+                    raise PaperScriptError(
+                        f"JAR archive must contain exactly one regular {JAR_MANIFEST_PATH}."
+                    )
+                manifest_info = manifest_entries[0]
+                if manifest_info.file_size > MAX_JAR_MANIFEST_BYTES:
+                    raise PaperScriptError(
+                        f"JAR manifest exceeds the {format_bytes(MAX_JAR_MANIFEST_BYTES)} safety limit."
+                    )
+                main_class = manifest_main_class(archive.read(manifest_info))
+
+                main_class_path = main_class.replace(".", "/") + ".class"
+                main_class_entries = [
+                    entry for entry in entries if entry.filename == main_class_path
+                ]
+                if len(main_class_entries) != 1 or main_class_entries[0].is_dir():
+                    raise PaperScriptError(
+                        f"JAR Main-Class {main_class!r} does not have exactly one {main_class_path} entry."
+                    )
+                with archive.open(main_class_entries[0], "r") as class_handle:
+                    if class_handle.read(4) != b"\xca\xfe\xba\xbe":
+                        raise PaperScriptError(
+                            f"JAR Main-Class entry {main_class_path} is not a Java class file."
+                        )
+
+                corrupt_entry = archive.testzip()
+                if corrupt_entry is not None:
+                    raise PaperScriptError(
+                        f"JAR CRC/decompression verification failed for entry {corrupt_entry!r}."
+                    )
+    except PaperScriptError:
+        raise
+    except (
+        OSError,
+        EOFError,
+        RuntimeError,
+        ValueError,
+        NotImplementedError,
+        zipfile.BadZipFile,
+        zipfile.LargeZipFile,
+    ) as error:
+        raise PaperScriptError(f"Artifact is not an intact executable JAR: {error}") from error
+
+    return ArtifactVerification(
+        sha256=digest,
+        size=descriptor_stat.st_size,
+        entry_count=len(regular_entries),
+        main_class=main_class,
+    )
 
 
 class Logger:
@@ -915,9 +1085,15 @@ class PaperAPI:
                 return build
         return None
 
-    def download_file(self, build: BuildInfo, destination: Path) -> DownloadVerification:
+    def download_file(
+        self,
+        build: BuildInfo,
+        destination: Path,
+        destination_descriptor: int | None = None,
+    ) -> DownloadVerification:
         ensure_directory(destination.parent)
         request = Request(build.download_url, headers={"User-Agent": self.user_agent})
+        expected_size = build.size if isinstance(build.size, int) and not isinstance(build.size, bool) else None
         for attempt in range(self.retries + 1):
             sha256 = hashlib.sha256()
             bytes_written = 0
@@ -925,14 +1101,40 @@ class PaperAPI:
             try:
                 if self.debug_http:
                     self._log_http(f"HTTP DOWNLOAD {attempt + 1}/{self.retries + 1}: {build.download_url}")
-                with urlopen(request, timeout=self.timeout) as response, destination.open("wb") as handle:
-                    while True:
-                        chunk = response.read(1024 * 1024)
-                        if not chunk:
-                            break
-                        sha256.update(chunk)
-                        bytes_written += len(chunk)
-                        handle.write(chunk)
+                if destination_descriptor is None:
+                    flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
+                    if hasattr(os, "O_NOFOLLOW"):
+                        flags |= os.O_NOFOLLOW
+                    output_descriptor = os.open(destination, flags, 0o600)
+                else:
+                    output_descriptor = os.dup(destination_descriptor)
+                try:
+                    output_stat = os.fstat(output_descriptor)
+                    if not stat.S_ISREG(output_stat.st_mode):
+                        raise PaperScriptError(
+                            f"Download destination for {build.filename} is not a regular file."
+                        )
+                    with os.fdopen(output_descriptor, "wb") as handle:
+                        output_descriptor = -1
+                        handle.seek(0)
+                        handle.truncate(0)
+                        with urlopen(request, timeout=self.timeout) as response:
+                            while True:
+                                chunk = response.read(1024 * 1024)
+                                if not chunk:
+                                    break
+                                if expected_size is not None and bytes_written + len(chunk) > expected_size:
+                                    raise PaperScriptError(
+                                        f"Download exceeded the Paper API size for {build.filename}: "
+                                        f"expected {expected_size} bytes."
+                                    )
+                                sha256.update(chunk)
+                                bytes_written += len(chunk)
+                                handle.write(chunk)
+                        handle.flush()
+                finally:
+                    if output_descriptor >= 0:
+                        os.close(output_descriptor)
                 elapsed_seconds = time.monotonic() - started_at
                 if self.debug_http:
                     self._log_http(
@@ -942,8 +1144,6 @@ class PaperAPI:
                 break
             except HTTPError as error:
                 detail_raw = error.read().decode("utf-8", errors="ignore") if hasattr(error, "read") else ""
-                if destination.exists():
-                    destination.unlink()
                 if error.code in TRANSIENT_HTTP_CODES and attempt < self.retries:
                     wait_seconds = self.retry_backoff_seconds * (2 ** attempt)
                     self._log_http(
@@ -959,8 +1159,6 @@ class PaperAPI:
                     message += " The Paper API or Cloudflare may be having a temporary issue; please retry."
                 raise PaperScriptError(message) from error
             except URLError as error:
-                if destination.exists():
-                    destination.unlink()
                 if attempt < self.retries:
                     wait_seconds = self.retry_backoff_seconds * (2 ** attempt)
                     self._log_http(
@@ -970,8 +1168,6 @@ class PaperAPI:
                     continue
                 raise PaperScriptError(f"Download failed: {error.reason}") from error
             except (OSError, http.client.IncompleteRead) as error:
-                if destination.exists():
-                    destination.unlink()
                 transient = isinstance(
                     error,
                     (TimeoutError, ConnectionError, http.client.IncompleteRead),
@@ -2366,13 +2562,156 @@ class PaperScriptApp:
             )
         return self.server_dir / target_name
 
+    @contextmanager
+    def private_staging_file(
+        self,
+        target_path: Path,
+        expected_size: int,
+    ) -> Iterator[tuple[int, Path]]:
+        """Create one private same-filesystem inode and only clean the same identity."""
+        descriptor = -1
+        temp_path: Path | None = None
+        staging_identity: tuple[int, int] | None = None
+        try:
+            try:
+                descriptor, temporary_name = tempfile.mkstemp(
+                    dir=self.server_dir,
+                    prefix=f".{target_path.name}.",
+                    suffix=".part",
+                )
+                temp_path = Path(temporary_name)
+                descriptor_stat = os.fstat(descriptor)
+                staging_identity = (descriptor_stat.st_dev, descriptor_stat.st_ino)
+                os.fchmod(descriptor, 0o600)
+            except OSError as error:
+                raise PaperScriptError(
+                    f"Staging preflight could not create a private temporary file in "
+                    f"{self.server_dir}: {error}"
+                ) from error
+
+            if not stat.S_ISREG(descriptor_stat.st_mode):
+                raise PaperScriptError(
+                    f"Staging preflight did not create a regular temporary file in {self.server_dir}."
+                )
+
+            try:
+                free_bytes = shutil.disk_usage(self.server_dir).free
+            except OSError as error:
+                raise PaperScriptError(
+                    f"Staging preflight could not determine free disk space for {self.server_dir}: {error}"
+                ) from error
+            reserve_bytes = max(
+                STAGING_FREE_SPACE_RESERVE_BYTES,
+                math.ceil(expected_size * 0.10),
+            )
+            required_free_bytes = expected_size + reserve_bytes
+            if free_bytes < required_free_bytes:
+                raise PaperScriptError(
+                    f"Staging preflight found only {format_bytes(free_bytes)} free in {self.server_dir}; "
+                    f"{format_bytes(expected_size)} is needed for {target_path.name} and "
+                    f"{format_bytes(reserve_bytes)} must remain free. No download was started."
+                )
+
+            fsync_directory(self.server_dir, strict=True)
+            self.logger.log(
+                f"Staging preflight: write access and durable directory sync confirmed; "
+                f"{format_bytes(required_free_bytes)} required including reserve, "
+                f"{format_bytes(free_bytes)} available."
+            )
+            yield descriptor, temp_path
+        finally:
+            active_error = sys.exc_info()[1]
+            cleanup_errors: list[str] = []
+            if descriptor >= 0:
+                try:
+                    os.close(descriptor)
+                except OSError as error:
+                    cleanup_errors.append(f"could not close the temporary file: {error}")
+            if temp_path is not None and os.path.lexists(temp_path):
+                try:
+                    cleanup_stat = temp_path.lstat()
+                    if staging_identity is None or (
+                        cleanup_stat.st_dev,
+                        cleanup_stat.st_ino,
+                    ) != staging_identity:
+                        cleanup_errors.append(
+                            f"refused to remove changed temporary path {temp_path}"
+                        )
+                    else:
+                        temp_path.unlink()
+                except OSError as error:
+                    cleanup_errors.append(f"could not remove {temp_path}: {error}")
+            if cleanup_errors:
+                message = "Staging temporary-file cleanup was incomplete: " + "; ".join(cleanup_errors)
+                if active_error is None:
+                    raise PaperScriptError(message)
+                self.logger.log(message)
+
+    def assert_staging_path_identity(self, path: Path, descriptor: int) -> os.stat_result:
+        """Require the private path to still name the inode opened during preflight."""
+        try:
+            path_stat = path.lstat()
+            descriptor_stat = os.fstat(descriptor)
+        except OSError as error:
+            raise PaperScriptError(f"Staging temporary file changed or disappeared: {error}") from error
+        if (
+            not stat.S_ISREG(path_stat.st_mode)
+            or (path_stat.st_dev, path_stat.st_ino)
+            != (descriptor_stat.st_dev, descriptor_stat.st_ino)
+        ):
+            raise PaperScriptError(
+                "Staging temporary path no longer identifies the private regular file created during preflight."
+            )
+        return descriptor_stat
+
+    def verify_existing_staged_target(
+        self,
+        target_path: Path,
+        build: BuildInfo,
+    ) -> tuple[ArtifactVerification, os.stat_result]:
+        """Verify an existing target without following a symlink or trusting its name."""
+        flags = os.O_RDONLY
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        try:
+            descriptor = os.open(target_path, flags)
+        except OSError as error:
+            raise PaperScriptError(
+                f"Could not safely open existing staging target {target_path}: {error}"
+            ) from error
+        try:
+            descriptor_stat = os.fstat(descriptor)
+            path_stat = target_path.lstat()
+            if (
+                not stat.S_ISREG(descriptor_stat.st_mode)
+                or not stat.S_ISREG(path_stat.st_mode)
+                or (path_stat.st_dev, path_stat.st_ino)
+                != (descriptor_stat.st_dev, descriptor_stat.st_ino)
+            ):
+                raise PaperScriptError(
+                    f"Existing staging target {target_path} changed identity or is not a regular file."
+                )
+            verification = verify_paper_artifact_descriptor(descriptor, build)
+            return verification, descriptor_stat
+        finally:
+            os.close(descriptor)
+
     def print_dry_run_summary(self, target_path: Path, current: JarInfo | None, build: BuildInfo) -> None:
         self.logger.log("Dry run: no server JAR or managed archive files were changed.")
         self.logger.log(f"Dry run: would download {build.download_url}")
-        if build.sha256:
-            self.logger.log(f"Dry run: expected SHA-256 from API is {build.sha256}")
+        self.logger.log(f"Dry run: expected size from API is {format_bytes(build.size)}")
+        self.logger.log(f"Dry run: expected SHA-256 from API is {build.sha256}")
+        self.logger.log(
+            "Dry run: would preflight server-root write access, durable directory sync, and free disk reserve."
+        )
         self.logger.log(f"Dry run: would download to a unique temporary file in {self.server_dir}")
-        self.logger.log(f"Dry run: would atomically stage {target_path.name} beside the existing jar(s)")
+        self.logger.log(
+            "Dry run: would verify the on-disk size, SHA-256, executable JAR manifest/class, "
+            "and every ZIP entry CRC before publication."
+        )
+        self.logger.log(
+            f"Dry run: would atomically publish {target_path.name} without overwriting an existing path."
+        )
         if target_path.exists():
             self.logger.log(
                 f"Dry run: {target_path.name} already exists and would only be accepted if its SHA-256 matches the API."
@@ -2414,6 +2753,7 @@ class PaperScriptApp:
         prompt_for_forced_recheck: bool = False,
     ) -> None:
         target_path = self.stage_target_path(build)
+        expected_size = require_artifact_metadata(build)
         current = self.find_current_jar()
         same_family = self.managed_server_jars(build.version)
         known_same_family_builds = [jar.build for jar in same_family]
@@ -2523,26 +2863,27 @@ class PaperScriptApp:
             self.print_dry_run_summary(target_path, current, build)
             return
 
-        if not build.sha256 or not re.fullmatch(r"[0-9a-fA-F]{64}", str(build.sha256)):
-            raise PaperScriptError(
-                f"Paper API did not provide a valid SHA-256 for {build.filename}; staging was refused."
-            )
         if target_path.is_symlink() or (target_path.exists() and not target_path.is_file()):
             raise PaperScriptError(f"Refusing to replace a symlink or non-file staging target: {target_path}")
         existing_identity: tuple[int, int, int, int, str] | None = None
         if target_path.exists():
-            existing_stat = target_path.lstat()
-            existing_sha = sha256_file(target_path)
-            if existing_sha.lower() != build.sha256.lower():
-                raise PaperScriptError(
-                    f"Target {target_path.name} already exists with a different SHA-256. "
-                    "PaperScript will not overwrite a possibly active or locally modified jar."
+            try:
+                existing_verification, existing_stat = self.verify_existing_staged_target(
+                    target_path,
+                    build,
                 )
+            except PaperScriptError as error:
+                raise PaperScriptError(
+                    f"Target {target_path.name} already exists but failed exact Paper artifact "
+                    f"validation ({error}). PaperScript will not overwrite a possibly active or "
+                    "locally modified jar."
+                ) from error
             if not force_requested:
                 self.logger.log(
-                    f"Staged target {target_path.name} already exists and matches the Paper API SHA-256; left it unchanged."
+                    f"Staged target {target_path.name} already matches the Paper API size and SHA-256 "
+                    "and is an intact executable JAR; left it unchanged."
                 )
-                self.record_state(build, target_path, existing_sha)
+                self.record_state(build, target_path, existing_verification.sha256)
                 self.reconcile_after_stage(build.version, target_path)
                 return
             existing_identity = (
@@ -2550,60 +2891,70 @@ class PaperScriptApp:
                 existing_stat.st_ino,
                 existing_stat.st_size,
                 existing_stat.st_mtime_ns,
-                existing_sha,
+                existing_verification.sha256,
             )
             self.logger.log(
                 f"Force re-download will verify fresh bytes for {target_path.name} without replacing the existing file."
             )
 
-        descriptor, temporary_name = tempfile.mkstemp(
-            dir=self.server_dir,
-            prefix=f".{target_path.name}.",
-            suffix=".part",
-        )
-        os.close(descriptor)
-        temp_path = Path(temporary_name)
-        temp_path.chmod(0o600)
-
-        self.logger.log(
-            f"Downloading Paper {build.version} build #{build.build_id} "
-            f"({build.channel}, {format_bytes(build.size)})..."
-        )
         stage_started_at = time.monotonic()
-        try:
+        with self.private_staging_file(target_path, expected_size) as (descriptor, temp_path):
+            self.logger.log(
+                f"Downloading Paper {build.version} build #{build.build_id} "
+                f"({build.channel}, {format_bytes(expected_size)})..."
+            )
             try:
-                verification = self.api.download_file(build, temp_path)
+                download_verification = self.api.download_file(build, temp_path, descriptor)
             except PaperScriptError:
                 raise
             except OSError as error:
                 raise PaperScriptError(
                     f"Download I/O failed for {build.filename}: {error}"
                 ) from error
-            if build.size is not None and verification.bytes_written != build.size:
+
+            self.assert_staging_path_identity(temp_path, descriptor)
+            if download_verification.bytes_written != expected_size:
                 raise PaperScriptError(
-                    f"Downloaded size mismatch for {build.filename}: expected {build.size}, "
-                    f"got {verification.bytes_written} bytes."
+                    f"Downloaded size mismatch for {build.filename}: expected {expected_size}, "
+                    f"transport reported {download_verification.bytes_written} bytes."
                 )
-            if verification.sha256.lower() != build.sha256.lower():
+            artifact_verification = verify_paper_artifact_descriptor(descriptor, build)
+            if str(download_verification.sha256).lower() != artifact_verification.sha256.lower():
                 raise PaperScriptError(
-                    f"Checksum mismatch for {build.filename}: expected {build.sha256}, got {verification.sha256}"
+                    f"Download stream SHA-256 for {build.filename} disagrees with the verified "
+                    "on-disk staging inode."
                 )
-            with temp_path.open("rb+") as handle:
-                os.fsync(handle.fileno())
-            temp_path.chmod(0o644)
+
+            try:
+                os.fchmod(descriptor, 0o644)
+                os.fsync(descriptor)
+            except OSError as error:
+                raise PaperScriptError(
+                    f"Could not durably sync the verified JAR before publication: {error}"
+                ) from error
+            self.assert_staging_path_identity(temp_path, descriptor)
+            self.logger.log(
+                f"JAR validation: {artifact_verification.entry_count} files passed ZIP CRC checks; "
+                f"executable Main-Class is {artifact_verification.main_class}."
+            )
+
             if existing_identity is not None:
-                if target_path.is_symlink() or not target_path.is_file():
-                    raise PaperScriptError(
-                        f"Existing target {target_path.name} changed type during force re-download; left it unchanged."
+                try:
+                    after_verification, after = self.verify_existing_staged_target(
+                        target_path,
+                        build,
                     )
-                after = target_path.lstat()
-                after_sha = sha256_file(target_path)
+                except PaperScriptError as error:
+                    raise PaperScriptError(
+                        f"Existing target {target_path.name} changed during force re-download; "
+                        "left it unchanged."
+                    ) from error
                 after_identity = (
                     after.st_dev,
                     after.st_ino,
                     after.st_size,
                     after.st_mtime_ns,
-                    after_sha,
+                    after_verification.sha256,
                 )
                 if after_identity != existing_identity:
                     raise PaperScriptError(
@@ -2611,30 +2962,56 @@ class PaperScriptApp:
                     )
             else:
                 try:
-                    os.link(temp_path, target_path)
+                    os.link(temp_path, target_path, follow_symlinks=False)
                 except FileExistsError as error:
                     raise PaperScriptError(
                         f"Target {target_path.name} appeared while the download was in progress; no file was overwritten."
                     ) from error
-                temp_path.unlink()
-                fsync_directory(self.server_dir)
-        finally:
-            if temp_path.exists():
-                temp_path.unlink()
+                except OSError as error:
+                    raise PaperScriptError(
+                        f"Could not atomically publish {target_path.name} without overwriting an existing "
+                        f"path: {error}"
+                    ) from error
+
+                try:
+                    published_stat = target_path.lstat()
+                    staged_stat = os.fstat(descriptor)
+                except OSError as error:
+                    raise PaperScriptError(
+                        f"Could not confirm the published identity for {target_path.name}: {error}"
+                    ) from error
+                if (
+                    not stat.S_ISREG(published_stat.st_mode)
+                    or (published_stat.st_dev, published_stat.st_ino)
+                    != (staged_stat.st_dev, staged_stat.st_ino)
+                ):
+                    raise PaperScriptError(
+                        f"Published target {target_path.name} did not retain the verified staging-file identity."
+                    )
+                try:
+                    temp_path.unlink()
+                    fsync_directory(self.server_dir, strict=True)
+                except (OSError, PaperScriptError) as error:
+                    raise PaperScriptError(
+                        f"Verified target {target_path.name} was published, but final temporary-link "
+                        f"cleanup or directory synchronization failed: {error}"
+                    ) from error
 
         if existing_identity is None:
-            self.logger.log(f"Staged: {target_path.name} ({build.channel}, SHA-256 verified)")
+            self.logger.log(
+                f"Staged: {target_path.name} ({build.channel}, size, SHA-256, and executable JAR verified)"
+            )
         else:
             self.logger.log(
                 f"Re-downloaded and verified: {target_path.name} ({build.channel}); existing staged file unchanged"
             )
         self.logger.log(f"Expected SHA-256: {build.sha256}")
-        self.logger.log(f"Downloaded SHA-256: {verification.sha256}")
+        self.logger.log(f"Downloaded SHA-256: {artifact_verification.sha256}")
         self.logger.log(
-            f"Download timing: {format_duration(verification.elapsed_seconds)} at "
-            f"{format_rate(verification.bytes_written, verification.elapsed_seconds)}"
+            f"Download timing: {format_duration(download_verification.elapsed_seconds)} at "
+            f"{format_rate(download_verification.bytes_written, download_verification.elapsed_seconds)}"
         )
-        self.record_state(build, target_path, verification.sha256)
+        self.record_state(build, target_path, artifact_verification.sha256)
         self.reconcile_after_stage(build.version, target_path)
         self.logger.log(f"Total staging timing: {format_duration(time.monotonic() - stage_started_at)}")
         self.logger.log("PaperScript did not stop, start, restart, or signal the server process.")

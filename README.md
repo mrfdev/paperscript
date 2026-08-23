@@ -46,7 +46,9 @@ Bash still has a place here, which is why the launcher remains a simple `papersc
 - Stages a newer same-version stable build only when the command is run manually.
 - Prompts before staging a newer or older Minecraft version family.
 - Supports forced re-download of the same build with `--force`.
-- Verifies downloads against the API-provided SHA-256.
+- Requires the Paper API size and SHA-256 before staging and never writes beyond the declared size.
+- Preflights server-root write access, durable directory sync, and enough free space for the JAR plus a safety reserve.
+- Verifies the exact private staging inode against the API size/SHA-256 and checks its executable manifest, Main-Class bytecode, and every ZIP entry CRC.
 - Stores staged-build identity and SHA-256 in `state.json` for later `verify` checks.
 - Caches Paper API metadata locally so repeated release checks are faster.
 - Publishes the verified download atomically as `Paper-<version>-<build>.jar` without replacing an existing JAR.
@@ -102,6 +104,8 @@ If you already run a live server and want to replace an older local PaperScript 
 ```
 
 These examples assume a central checkout. In the compact in-root layout, omit the repeated `--server-dir` option.
+
+PaperScript remains a drop-in component for server roots launched through `1MB-start.sh` and `1MB-minecraft.sh`. Replacing `paperscript.sh` and the tracked program files under `paperscript/` does not require a launcher edit, config migration, new package, or new command-line option. Preserve the server-local `paperscript/config.json`, `paperscript/state.json`, and `paperscript/last-launched-jar.txt`; the file locations, marker format, numeric JAR naming contract, and manual-start behavior are unchanged.
 
 For servers that use the required numeric naming pattern, such as `Paper-26.2-84.jar`, PaperScript detects the newest local build and stages the next verified build beside it. The updated `1MB-minecraft.sh` selects the greatest numeric build for its configured Minecraft version on the next manual start.
 
@@ -161,7 +165,9 @@ Behavior:
 - If the launcher-selected version has a newer stable build, it stages that build.
 - If the newest staged build for the launcher family already matches stable, `--force update` re-downloads and verifies it without replacing the existing file.
 - `update` stays on the launcher-selected Minecraft version even when a newer family exists; cross-version staging requires an explicit `download --version ...` command.
-- The download is SHA-256 and size verified, fsynced, then atomically published under its numeric build filename.
+- Before network activity, PaperScript confirms that the server root can create a private file and durably sync directory entries. It also requires enough free space for the API-declared JAR size plus at least 64 MiB of remaining headroom (or 10% of the JAR size when that is larger).
+- The response is capped at the API-declared size. The exact on-disk inode must match that size and SHA-256, contain one executable JAR manifest and its Main-Class bytecode, and pass CRC/decompression checks for every ZIP entry.
+- The verified file is mode `0644`, fsynced, then atomically published under its numeric build filename without overwriting any path that appeared concurrently.
 - PaperScript never asks to stop the server and contains no stop/kill path.
 - After staging, valid launcher identity enables bounded root cleanup; missing/invalid identity defers cleanup without guessing.
 - If `--dry-run` is used, it reports JAR/archive actions without staging, moving, or pruning JARs; normal target-local config, logging, and metadata-cache activity may still occur.
@@ -540,7 +546,7 @@ PaperScript stores its runtime files inside the visible `paperscript/` directory
 - `paperscript/logs.log`
   Activity log
 - `paperscript/downloads/`
-  Legacy/diagnostic download workspace; active staging uses a unique hidden temp file on the server filesystem
+  Legacy/diagnostic download workspace; active staging uses one private hidden temp inode in the server root so publication stays on the same filesystem
 - `paperscript/cache/`
   Cached Paper API metadata used to speed up repeated checks
 - `paperscript/backups/jars/<version>/`
@@ -740,7 +746,7 @@ bash -n paperscript.sh 1MB-minecraft.sh tests/live-smoke.sh
 python3 -m py_compile paperscript/paperscript.py tests/test_paperscript.py tests/test_1mb_minecraft.py
 ```
 
-The unit suite verifies version ordering, stable-channel defaults, same-version build-upgrade behavior, preview selection, saved channel metadata, atomic state/config defaults, launcher marker publication and rollback, numeric latest-build selection, non-disruptive staging, per-server and active-launch locking, fail-closed marker handling, symlink/version containment, dry-run pruning previews, root retention, and archive caps. Launcher tests use a disposable fake `java` executable and never start a real server.
+The unit suite verifies version ordering, stable-channel defaults, same-version build-upgrade behavior, preview selection, saved channel metadata, atomic state/config defaults, launcher marker publication and rollback, numeric latest-build selection, non-disruptive staging, disk/permission/durability preflight, response size caps, private-inode continuity, executable JAR/CRC validation, per-server and active-launch locking, fail-closed marker handling, symlink/version containment, dry-run pruning previews, root retention, and archive caps. Launcher tests use a disposable fake `java` executable and never start a real server.
 
 Run the opt-in live PaperMC smoke test:
 
@@ -762,7 +768,7 @@ GitHub Actions runs the network-free unit and syntax checks on current macOS and
 
 PaperScript keeps a live local todo file at [paperscript/todo.log](./paperscript/todo.log) for deferred ideas that are not implemented yet.
 
-Current completed production foundations include manual non-disruptive staging, per-server locking, atomic staged publication/state, bounded JAR retention, and latest-build launcher selection with an active marker. Remaining queued ideas include:
+Current completed production foundations include manual non-disruptive transactional staging, per-server locking, atomic no-overwrite publication/state, bounded JAR retention, and latest-build launcher selection with an active marker. Remaining queued ideas include:
 
 - metadata-cache durability and corrupt-cache diagnostics
 - manual review/application of the launcher diff to the canonical `1MB-minecraft.sh`
