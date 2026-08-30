@@ -35,10 +35,7 @@ config.update(
         "tmux_session": "paperscript-live-smoke",
         "default_channel": "STABLE",
         "check_latest_channel_only": "STABLE",
-        "allow_cross_version_auto_upgrade": False,
         "allow_same_version_build_upgrade": True,
-        "download_filename_pattern": "Paper-{version}.jar",
-        "running_server_action": "ask",
         "no_color": True,
     }
 )
@@ -65,35 +62,34 @@ root = Path(sys.argv[1])
 runtime = root / "paperscript"
 config = json.loads((runtime / "config.json").read_text(encoding="utf-8"))
 state = json.loads((runtime / "state.json").read_text(encoding="utf-8"))
-jar_path = root / state["current_jar"]
-version_numbers = tuple(int(part) for part in state["current_version"].split("."))
+jar_path = root / state["staged_jar"]
+version_numbers = tuple(int(part) for part in state["staged_version"].split("."))
 
 assert config["default_channel"] == "STABLE"
 assert config["check_latest_channel_only"] == "STABLE"
 assert config["allow_same_version_build_upgrade"] is True
-assert config["download_filename_pattern"] == "Paper-{version}.jar"
-assert state["current_channel"] == "STABLE"
+assert state["staged_channel"] == "STABLE"
 assert version_numbers >= (26, 2)
-assert state["current_jar"] == f"Paper-{state['current_version']}.jar"
+assert state["staged_jar"] == f"Paper-{state['staged_version']}-{state['staged_build']}.jar"
 assert jar_path.is_file()
 
 digest = hashlib.sha256(jar_path.read_bytes()).hexdigest()
-assert digest == state["current_sha256"]
+assert digest == state["staged_sha256"]
 assert digest == state["expected_sha256"]
 
 status = (root / "status.txt").read_text(encoding="utf-8")
 verify = (root / "verify.txt").read_text(encoding="utf-8")
-assert f"version {state['current_version']}, build #{state['current_build']}" in status
+assert f"version {state['staged_version']}, build #{state['staged_build']}" in status
 assert "channel STABLE" in status
 assert str(jar_path) in status
-assert "already on the latest stable build" in status
-assert "Recorded install channel: STABLE" in verify
+assert "latest stable build for the launcher family is already staged" in status
+assert "Recorded staging channel: STABLE" in verify
 assert "API channel: STABLE" in verify
-assert "Current SHA-256 matches API expected SHA: yes" in verify
+assert "Newest managed SHA-256 matches API expected SHA: yes" in verify
 
 print(
     "Live smoke passed: "
-    f"Paper {state['current_version']} build #{state['current_build']} "
-    f"({state['current_channel']}), {jar_path}, SHA-256 {digest}"
+    f"Paper {state['staged_version']} build #{state['staged_build']} "
+    f"({state['staged_channel']}), {jar_path}, SHA-256 {digest}"
 )
 PY

@@ -1,6 +1,89 @@
-PaperScript todo
+PaperScript production todo
 
-- Future automation: optional update scheduling or smarter unattended workflows.
-- Future cleanup polish: extra selective cleanup and repair helpers beyond the current safe set.
-- Future tmux/server control: start, stop, restart, and richer session management helpers.
-- Future validation mode: additional smoke-test or planner mode beyond today's dry-run behavior.
+Product direction and boundaries
+
+- [x] Keep PaperScript manually invoked. Remove cron, scheduling, and unattended-update recommendations.
+- [x] Make update a non-disruptive staging operation: download and verify a new
+      Paper-<version>-<build>.jar beside the active jar while the server keeps running.
+      PaperScript must not stop, kill, start, or restart the server, and must not replace
+      the jar currently in use.
+- [x] Keep tmux lifecycle control manual and external to PaperScript. PaperScript may use
+      tmux information for read-only status and doctor checks, but update must not send
+      stop or start commands.
+- [x] Keep full server, world, plugin, and BlueMap backup orchestration separate. A quick
+      Paper jar download must not wait for hundreds of gigabytes of backup work. Limit
+      PaperScript itself to safe jar retention and cleanup.
+
+Safe jar staging
+
+- [x] Add a per-server exclusive lock so overlapping manual runs cannot share, remove,
+      or overwrite each other's staged downloads or state.
+- [x] Make staging transactional: require Paper API size and SHA-256, preflight server-root
+      write access, durable directory sync, and free-space reserve; stream into one private
+      same-filesystem inode without exceeding the declared size; verify on-disk size,
+      SHA-256, executable JAR structure, and every ZIP CRC; fsync; then atomically publish
+      Paper-<version>-<build>.jar without overwriting an existing path.
+- [x] Write config and state atomically with temp files, fsync, and os.replace; preserve
+      and report corrupt JSON instead of silently replacing it.
+- [x] Write metadata cache atomically through validated directory descriptors and reject
+      unsafe cache directories and leaves.
+- [ ] Preserve a corrupt cache for diagnosis before refreshing it.
+- [x] Validate and contain every configured path. Reject filesystem roots, traversal,
+      unsafe symlinks, and jar filename patterns that are not plain .jar basenames.
+- [x] Namespace runtime state and locks by canonical server directory so one PaperScript
+      checkout can safely target more than one server.
+
+1MB-minecraft.sh integration
+
+- [x] Copy the latest canonical 1MB-minecraft.sh into the disposable PaperScript test
+      instance and record its original SHA-256 for later manual comparison.
+- [x] Customize the test-instance copy so, for its configured Minecraft version, it
+      recognizes Paper-<version>-<numeric-build>.jar and selects the greatest numeric build
+      on the next manual start. Never select a jar from another Minecraft version.
+- [x] Preserve compatibility with the existing paper-<version>.jar naming fallback, ignore
+      .part and malformed files, handle case consistently, and use numeric rather than
+      lexicographic build ordering.
+- [x] Add launcher tests for multiple builds, multiple Minecraft versions, legacy fallback,
+      malformed names, and build-number boundaries such as 9 versus 10.
+- [x] Record the exact launcher-selected basename atomically before Java starts, resolve
+      the launcher's own directory, ignore symlink jar candidates, hold a fail-closed
+      launch lock for the JVM lifetime, and restore the prior marker on JVM failure.
+- [ ] Manually review and apply the test-instance launcher diff at its canonical source,
+      then propagate it through the normal 1MB-minecraft.sh release/update flow rather than
+      editing every generated server copy.
+
+Bounded Paper jar retention
+
+- [x] Keep the valid last-launched jar plus the newest staged same-version jar in the
+      server root by default; temporarily protect one in-flight launcher rollback jar;
+      never infer or move an active jar without a valid marker.
+- [x] Archive only exact regular non-symlink Paper-<version>-<numeric-build>.jar files for
+      the marker version under paperscript/backups/jars/<version>/ and cap that archive.
+- [x] Add explicit cleanup --server-jars with confirmation, --keep, --version, and dry-run;
+      keep it out of cleanup --all and preserve the old cleanup --keep backup behavior.
+- [x] Add adversarial tests for numeric ordering, versions, malformed names, symlinks,
+      invalid markers, archive caps, lock contention, and active-jar byte/inode stability.
+
+Validation and operator feedback
+
+- [ ] Add a read-only doctor command covering supported Java version, disk space,
+      permissions, API access, config/state validity, active and staged jars, and tmux
+      identity without controlling the tmux session.
+- [x] Make verify fail closed: require a valid SHA-256 for production downloads and return
+      nonzero status for mismatch or unverifiable state.
+- [ ] Add machine-readable JSON output and documented exit codes for current, update
+      available, staged, no-op, mismatch, degraded/API unavailable, and invalid config.
+- [ ] Review the Codex Security report.md Security Objectives and Assumptions sections,
+      then reconcile accepted guarantees with repository documentation, tests, and deployment guidance.
+- [ ] Add offline/degraded status with stale-cache fallback, log rotation and severity/run
+      IDs, a --version option, supported-Python CI, and reproducible tagged releases with
+      checksummed artifacts.
+
+Tests
+
+- [ ] Add hermetic CLI integration tests using a local HTTP fixture and disposable server
+      roots for download retries, corrupt responses/cache, checksum mismatch, and exits.
+- [ ] Add failure-injection tests for concurrent runs, signals at every staging boundary,
+      full disks, path traversal and symlinks, corrupt JSON, and cross-filesystem paths.
+- [ ] Add manual or scheduled project CI smoke coverage for Java/Paper compatibility without
+      turning server updates themselves into scheduled production automation.

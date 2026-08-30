@@ -28,10 +28,10 @@ jobs:
           python-version: "3.9"
 
       - name: Check shell syntax
-        run: bash -n paperscript.sh tests/live-smoke.sh
+        run: bash -n paperscript.sh 1MB-minecraft.sh tests/live-smoke.sh
 
       - name: Check Python syntax
-        run: python -m py_compile paperscript/paperscript.py tests/test_paperscript.py
+        run: python -m py_compile paperscript/paperscript.py tests/test_paperscript.py tests/test_1mb_minecraft.py
 
       - name: Run unit tests
         run: python -m unittest discover -s tests -p "test_*.py" -v
