@@ -11,6 +11,7 @@ import json
 import math
 import os
 import re
+import secrets
 import shutil
 import stat
 import subprocess
@@ -24,6 +25,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterator, TextIO
 from urllib.error import HTTPError, URLError
+from urllib.parse import urlsplit
 from urllib.request import Request, urlopen
 
 
@@ -37,6 +39,10 @@ PAPER_DOWNLOADS_URL = "https://papermc.io/downloads/paper"
 DEFAULT_CHANNEL = "STABLE"
 DEFAULT_TIMEOUT = 30
 DEFAULT_USER_AGENT = f"mrfloris-PaperScript/2.0 ({PROJECT_URL})"
+STAGE_SELECTION_EXACT = "exact"
+STAGE_SELECTION_LATEST_CHANNEL = "latest-channel"
+STAGE_SELECTION_LATEST_OVERALL = "latest-overall"
+STAGE_SELECTION_LATEST_PREVIEW = "latest-preview"
 TRANSIENT_HTTP_CODES = {429, 500, 502, 503, 504, 520, 521, 522, 523, 524}
 STAGING_FREE_SPACE_RESERVE_BYTES = 64 * 1024 * 1024
 MAX_JAR_MANIFEST_BYTES = 1024 * 1024
@@ -76,6 +82,7 @@ ANSI_CYAN = "\033[36m"
 ANSI_BRIGHT_CYAN = "\033[96m"
 ANSI_MAGENTA = "\033[35m"
 ANSI_BRIGHT_WHITE = "\033[97m"
+ANSI_SGR_PATTERN = re.compile(r"\x1b\[[0-9;]*m")
 COLOR_THEMES: dict[str, dict[str, str]] = {
     "default": {
         "key": ANSI_BRIGHT_CYAN,
@@ -132,7 +139,9 @@ Safe jar staging
       Paper-<version>-<build>.jar without overwriting an existing path.
 - [x] Write config and state atomically with temp files, fsync, and os.replace; preserve
       and report corrupt JSON instead of silently replacing it.
-- [ ] Write metadata cache atomically and preserve a corrupt cache for diagnosis.
+- [x] Write metadata cache atomically through validated directory descriptors and reject
+      unsafe cache directories and leaves.
+- [ ] Preserve a corrupt cache for diagnosis before refreshing it.
 - [x] Validate and contain every configured path. Reject filesystem roots, traversal,
       unsafe symlinks, and jar filename patterns that are not plain .jar basenames.
 - [x] Namespace runtime state and locks by canonical server directory so one PaperScript
@@ -174,10 +183,12 @@ Validation and operator feedback
 - [ ] Add a read-only doctor command covering supported Java version, disk space,
       permissions, API access, config/state validity, active and staged jars, and tmux
       identity without controlling the tmux session.
-- [ ] Make verify fail closed: require a valid SHA-256 for production downloads and return
+- [x] Make verify fail closed: require a valid SHA-256 for production downloads and return
       nonzero status for mismatch or unverifiable state.
 - [ ] Add machine-readable JSON output and documented exit codes for current, update
       available, staged, no-op, mismatch, degraded/API unavailable, and invalid config.
+- [ ] Review the Codex Security report.md Security Objectives and Assumptions sections,
+      then reconcile accepted guarantees with repository documentation, tests, and deployment guidance.
 - [ ] Add offline/degraded status with stale-cache fallback, log rotation and severity/run
       IDs, a --version option, supported-Python CI, and reproducible tagged releases with
       checksummed artifacts.
@@ -307,6 +318,12 @@ class BuildInfo:
         return f"Paper-{self.version}-{self.build_id}.jar"
 
 
+@dataclass(frozen=True)
+class UpdateSelection:
+    build: BuildInfo
+    staging_policy: str
+
+
 @dataclass
 class DownloadVerification:
     sha256: str
@@ -343,6 +360,10 @@ class LauncherJarSelection:
         return self.build is not None
 
 
+class StyledConsoleText(str):
+    """Console text containing only PaperScript-owned styling around sanitized text."""
+
+
 class ServerMutationLock:
     """Non-blocking advisory lock for one server root."""
 
@@ -359,7 +380,8 @@ class ServerMutationLock:
             self.handle.close()
             self.handle = None
             raise PaperScriptError(
-                f"Another PaperScript staging or server-jar cleanup is already running for this server ({self.path})."
+                f"Another PaperScript staging, verification, or server-jar cleanup is already running "
+                f"for this server ({self.path})."
             ) from error
         return self
 
@@ -444,6 +466,26 @@ def style_key_value(
     return f"{label_prefix}{label}:{ANSI_RESET} {value_prefix}{value}{ANSI_RESET}"
 
 
+def terminal_safe_text(text: str) -> str:
+    """Render terminal control characters as visible text without reinterpreting them."""
+    escaped: list[str] = []
+    named = {"\n": r"\n", "\r": r"\r", "\t": r"\t"}
+    for character in str(text):
+        codepoint = ord(character)
+        if character in named:
+            escaped.append(named[character])
+        elif codepoint < 0x20 or 0x7F <= codepoint <= 0x9F:
+            escaped.append(f"\\x{codepoint:02x}")
+        else:
+            escaped.append(character)
+    return "".join(escaped)
+
+
+def plain_console_text(message: str) -> str:
+    """Remove PaperScript-owned SGR styling before writing a durable text log."""
+    return ANSI_SGR_PATTERN.sub("", str(message))
+
+
 def prompt_yes_no(question: str, default: bool = False, logger: "Logger | None" = None) -> bool:
     suffix = "[Y/n]" if default else "[y/N]"
     while True:
@@ -451,7 +493,7 @@ def prompt_yes_no(question: str, default: bool = False, logger: "Logger | None" 
         if logger is not None:
             reply = logger.prompt_input(prompt).strip().lower()
         else:
-            reply = input(prompt).strip().lower()
+            reply = input(terminal_safe_text(prompt)).strip().lower()
         if not reply:
             return default
         if reply in {"y", "yes"}:
@@ -473,19 +515,19 @@ def prompt_choice(
     if logger is not None:
         logger.info(question)
     else:
-        print(question)
+        print(terminal_safe_text(question))
     for key, label in choices:
         default_mark = " (default)" if default == key else ""
         if logger is not None:
             logger.log(f"  {key}) {label}{default_mark}")
         else:
-            print(f"  {key}) {label}{default_mark}")
+            print(terminal_safe_text(f"  {key}) {label}{default_mark}"))
     valid = {key for key, _ in choices}
     while True:
         if logger is not None:
             reply = logger.prompt_input("> ").strip().lower()
         else:
-            reply = input("> ").strip().lower()
+            reply = input(terminal_safe_text("> ")).strip().lower()
         if not reply and default is not None:
             return default
         if reply in valid:
@@ -567,6 +609,143 @@ def atomic_write_text(path: Path, content: str, mode: int = 0o600) -> None:
             temporary_path.unlink()
 
 
+def open_safe_cache_directory(path: Path) -> int | None:
+    """Open one owner-controlled cache directory for descriptor-relative operations."""
+    try:
+        path.mkdir(parents=True, exist_ok=True, mode=0o700)
+        before = path.lstat()
+    except OSError:
+        return None
+    if (
+        not stat.S_ISDIR(before.st_mode)
+        or (hasattr(os, "geteuid") and before.st_uid != os.geteuid())
+        or stat.S_IMODE(before.st_mode) & 0o022
+    ):
+        return None
+
+    flags = os.O_RDONLY
+    flags |= getattr(os, "O_DIRECTORY", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    flags |= getattr(os, "O_CLOEXEC", 0)
+    try:
+        descriptor = os.open(path, flags)
+    except OSError:
+        return None
+    try:
+        after = os.fstat(descriptor)
+    except OSError:
+        os.close(descriptor)
+        return None
+    if (
+        not stat.S_ISDIR(after.st_mode)
+        or (before.st_dev, before.st_ino) != (after.st_dev, after.st_ino)
+        or (hasattr(os, "geteuid") and after.st_uid != os.geteuid())
+        or stat.S_IMODE(after.st_mode) & 0o022
+    ):
+        os.close(descriptor)
+        return None
+    return descriptor
+
+
+def read_safe_cache_text(directory_descriptor: int, leaf_name: str) -> str | None:
+    """Read one regular cache inode relative to an already-validated directory."""
+    try:
+        before = os.stat(
+            leaf_name,
+            dir_fd=directory_descriptor,
+            follow_symlinks=False,
+        )
+    except (FileNotFoundError, OSError):
+        return None
+    if (
+        not stat.S_ISREG(before.st_mode)
+        or (hasattr(os, "geteuid") and before.st_uid != os.geteuid())
+        or stat.S_IMODE(before.st_mode) & 0o022
+    ):
+        return None
+
+    flags = os.O_RDONLY
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    flags |= getattr(os, "O_CLOEXEC", 0)
+    try:
+        descriptor = os.open(
+            leaf_name,
+            flags,
+            dir_fd=directory_descriptor,
+        )
+    except OSError:
+        return None
+    try:
+        after = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(after.st_mode)
+            or (before.st_dev, before.st_ino) != (after.st_dev, after.st_ino)
+            or (hasattr(os, "geteuid") and after.st_uid != os.geteuid())
+            or stat.S_IMODE(after.st_mode) & 0o022
+        ):
+            return None
+        with os.fdopen(descriptor, "r", encoding="utf-8") as handle:
+            descriptor = -1
+            return handle.read()
+    except (OSError, UnicodeDecodeError):
+        return None
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+
+
+def atomic_write_cache_text(
+    directory_descriptor: int,
+    leaf_name: str,
+    content: str,
+    mode: int = 0o600,
+) -> None:
+    """Atomically replace a cache leaf without resolving the directory pathname again."""
+    temporary_name = ""
+    descriptor = -1
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    flags |= getattr(os, "O_CLOEXEC", 0)
+    try:
+        for _ in range(16):
+            temporary_name = f".{leaf_name}.{secrets.token_hex(16)}.tmp"
+            try:
+                descriptor = os.open(
+                    temporary_name,
+                    flags,
+                    mode,
+                    dir_fd=directory_descriptor,
+                )
+                break
+            except FileExistsError:
+                continue
+        else:
+            raise PaperScriptError(f"Could not allocate a private cache file for {leaf_name}.")
+
+        os.fchmod(descriptor, mode)
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            descriptor = -1
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.rename(
+            temporary_name,
+            leaf_name,
+            src_dir_fd=directory_descriptor,
+            dst_dir_fd=directory_descriptor,
+        )
+        temporary_name = ""
+        os.fsync(directory_descriptor)
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        if temporary_name:
+            try:
+                os.unlink(temporary_name, dir_fd=directory_descriptor)
+            except FileNotFoundError:
+                pass
+
+
 def run_command(args: list[str]) -> subprocess.CompletedProcess[str]:
     try:
         return subprocess.run(
@@ -632,9 +811,33 @@ def required_artifact_size(build: BuildInfo) -> int:
     return build.size
 
 
+def normalized_sha256(value: object) -> str | None:
+    """Return one canonical SHA-256 digest or reject malformed metadata/state."""
+    if not isinstance(value, str) or not re.fullmatch(r"[0-9a-fA-F]{64}", value):
+        return None
+    return value.lower()
+
+
 def require_artifact_metadata(build: BuildInfo) -> int:
     """Fail closed when Fill omits either field needed for safe staging."""
-    if not isinstance(build.sha256, str) or not re.fullmatch(r"[0-9a-fA-F]{64}", build.sha256):
+    if not isinstance(build.download_url, str) or terminal_safe_text(build.download_url) != build.download_url:
+        parsed_url = None
+    else:
+        try:
+            parsed_url = urlsplit(build.download_url)
+        except ValueError:
+            parsed_url = None
+    if (
+        parsed_url is None
+        or parsed_url.scheme.casefold() != "https"
+        or not parsed_url.hostname
+        or parsed_url.username is not None
+        or parsed_url.password is not None
+    ):
+        raise PaperScriptError(
+            f"Paper API did not provide a safe HTTPS download URL for {build.filename}; staging was refused."
+        )
+    if normalized_sha256(build.sha256) is None:
         raise PaperScriptError(
             f"Paper API did not provide a valid SHA-256 for {build.filename}; staging was refused."
         )
@@ -850,11 +1053,17 @@ class Logger:
         return message
 
     def log(self, message: str) -> None:
-        line = f"[{utc_now()}] {message}"
+        if isinstance(message, StyledConsoleText):
+            log_message = terminal_safe_text(plain_console_text(message))
+            console_message = str(message)
+        else:
+            log_message = terminal_safe_text(str(message))
+            console_message = self._console_text(log_message)
+        line = f"[{utc_now()}] {log_message}"
         with self.log_path.open("a", encoding="utf-8") as handle:
             handle.write(line + "\n")
         if not self.quiet:
-            print(self._console_text(message))
+            print(console_message)
 
     def error(self, message: str) -> None:
         self.log(f"ERROR: {message}")
@@ -874,7 +1083,8 @@ class Logger:
                 "A prompt was required, but no interactive terminal is available. Re-run with --yes or adjust config."
             )
         try:
-            return input(color_text(message, self.theme["prompt"], self.use_color, bold=True))
+            safe_message = terminal_safe_text(message)
+            return input(color_text(safe_message, self.theme["prompt"], self.use_color, bold=True))
         except EOFError as error:
             raise PaperScriptError("Input stream closed while waiting for a reply. PaperScript cancelled the prompt.") from error
 
@@ -906,28 +1116,52 @@ class PaperAPI:
         if self.logger is not None and not self.logger.quiet:
             self.logger.log(message)
 
-    def _cache_path(self, label: str) -> Path | None:
+    def _cache_leaf_name(self, label: str) -> str:
+        safe_label = re.sub(r"[^A-Za-z0-9._-]+", "_", label.strip())
+        return f"{safe_label}.json"
+
+    def _open_cache_directory(self) -> int | None:
         if not self.cache_enabled or self.cache_dir is None:
             return None
-        ensure_directory(self.cache_dir)
-        safe_label = re.sub(r"[^A-Za-z0-9._-]+", "_", label.strip())
-        return self.cache_dir / f"{safe_label}.json"
+        return open_safe_cache_directory(self.cache_dir)
+
+    def _cache_path(self, label: str) -> Path | None:
+        directory_descriptor = self._open_cache_directory()
+        if directory_descriptor is None or self.cache_dir is None:
+            return None
+        os.close(directory_descriptor)
+        return self.cache_dir / self._cache_leaf_name(label)
 
     def _load_cache(self, label: str) -> Any | None:
-        cache_path = self._cache_path(label)
-        if cache_path is None or not cache_path.exists():
+        directory_descriptor = self._open_cache_directory()
+        if directory_descriptor is None:
             return None
         try:
-            payload = json.loads(cache_path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
+            cache_text = read_safe_cache_text(
+                directory_descriptor,
+                self._cache_leaf_name(label),
+            )
+            if cache_text is None:
+                return None
+            payload = json.loads(cache_text)
+        except json.JSONDecodeError:
             return None
+        finally:
+            os.close(directory_descriptor)
         if not isinstance(payload, dict):
             return None
         cached_at = payload.get("cached_at_epoch")
         data = payload.get("data")
-        if not isinstance(cached_at, (int, float)):
+        if isinstance(cached_at, bool) or not isinstance(cached_at, (int, float)):
             return None
-        age_seconds = max(0.0, time.time() - float(cached_at))
+        try:
+            cached_at_float = float(cached_at)
+        except (OverflowError, ValueError):
+            return None
+        now = time.time()
+        if not math.isfinite(cached_at_float) or cached_at_float > now:
+            return None
+        age_seconds = now - cached_at_float
         if age_seconds > self.cache_ttl_seconds:
             return None
         if self.debug_http:
@@ -935,15 +1169,23 @@ class PaperAPI:
         return data
 
     def _save_cache(self, label: str, data: Any) -> None:
-        cache_path = self._cache_path(label)
-        if cache_path is None:
+        directory_descriptor = self._open_cache_directory()
+        if directory_descriptor is None:
             return
         payload = {
             "cached_at": utc_now(),
             "cached_at_epoch": time.time(),
             "data": data,
         }
-        cache_path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        try:
+            atomic_write_cache_text(
+                directory_descriptor,
+                self._cache_leaf_name(label),
+                json.dumps(payload, indent=2, sort_keys=True) + "\n",
+                mode=0o600,
+            )
+        finally:
+            os.close(directory_descriptor)
 
     def _request_json(self, url: str) -> Any:
         request = Request(url, headers={"User-Agent": self.user_agent, "Accept": "application/json"})
@@ -994,8 +1236,8 @@ class PaperAPI:
             raise PaperScriptError(data.get("message") or f"API returned an error for {url}")
         return data
 
-    def get_project_versions(self) -> list[dict[str, Any]]:
-        cached = self._load_cache("versions")
+    def get_project_versions(self, *, use_cache: bool = True) -> list[dict[str, Any]]:
+        cached = self._load_cache("versions") if use_cache else None
         rich = cached if cached is not None else self._request_json(f"{API_ROOT}/versions")
         if cached is None:
             self._save_cache("versions", rich)
@@ -1017,7 +1259,7 @@ class PaperAPI:
             if versions:
                 return sorted(versions, key=lambda item: parse_version(item["id"]).key(), reverse=True)
 
-        cached_simple = self._load_cache("project-root")
+        cached_simple = self._load_cache("project-root") if use_cache else None
         simple = cached_simple if cached_simple is not None else self._request_json(API_ROOT)
         if cached_simple is None:
             self._save_cache("project-root", simple)
@@ -1029,10 +1271,12 @@ class PaperAPI:
                     flattened.append({"id": version_id, "group": group})
         return sorted(flattened, key=lambda item: parse_version(item["id"]).key(), reverse=True)
 
-    def get_builds(self, version: str) -> list[BuildInfo]:
+    def get_builds(self, version: str, *, use_cache: bool = True) -> list[BuildInfo]:
+        if not SAFE_VERSION_PATTERN.fullmatch(version):
+            raise PaperScriptError(f"Unsafe Paper version identifier: {version!r}")
         try:
             cache_label = f"builds-{version}"
-            cached = self._load_cache(cache_label)
+            cached = self._load_cache(cache_label) if use_cache else None
             raw = cached if cached is not None else self._request_json(f"{API_ROOT}/versions/{version}/builds")
             if cached is None:
                 self._save_cache(cache_label, raw)
@@ -1072,15 +1316,27 @@ class PaperAPI:
         normalized.sort(key=lambda item: item.build_id, reverse=True)
         return normalized
 
-    def get_latest_build(self, version: str, channel: str = DEFAULT_CHANNEL) -> BuildInfo | None:
+    def get_latest_build(
+        self,
+        version: str,
+        channel: str = DEFAULT_CHANNEL,
+        *,
+        use_cache: bool = True,
+    ) -> BuildInfo | None:
         channel_upper = channel.upper()
-        for build in self.get_builds(version):
+        for build in self.get_builds(version, use_cache=use_cache):
             if build.channel == channel_upper:
                 return build
         return None
 
-    def get_build_by_id(self, version: str, build_id: int) -> BuildInfo | None:
-        for build in self.get_builds(version):
+    def get_build_by_id(
+        self,
+        version: str,
+        build_id: int,
+        *,
+        use_cache: bool = True,
+    ) -> BuildInfo | None:
+        for build in self.get_builds(version, use_cache=use_cache):
             if build.build_id == build_id:
                 return build
         return None
@@ -1223,6 +1479,7 @@ def resolve_color_theme(name: Any) -> dict[str, str]:
 def summarize_http_detail(detail: str) -> str:
     cleaned = re.sub(r"<[^>]+>", " ", detail)
     cleaned = " ".join(cleaned.split())
+    cleaned = terminal_safe_text(cleaned)
     if not cleaned:
         return ""
     return f"{cleaned[:220]}..." if len(cleaned) > 220 else cleaned
@@ -1419,13 +1676,16 @@ class PaperScriptApp:
             self.logger.log(f"Release page: {PAPER_DOWNLOADS_URL}")
 
     def format_browser_entry(self, prefix: str, value: str, suffix: str = "") -> str:
+        prefix = terminal_safe_text(prefix)
+        value = terminal_safe_text(value)
+        suffix = terminal_safe_text(suffix)
         if not self.logger.use_color:
             return f"{prefix}{value}{suffix}"
         theme = self.logger.theme
         rendered_prefix = color_text(prefix, theme["key"], True)
         rendered_value = color_text(value, theme["value"], True, bold=True)
         rendered_suffix = color_text(suffix, theme["key"], True) if suffix else ""
-        return f"{rendered_prefix}{rendered_value}{rendered_suffix}"
+        return StyledConsoleText(f"{rendered_prefix}{rendered_value}{rendered_suffix}")
 
     def _resolve_server_dir(self) -> Path:
         if self.args.server_dir:
@@ -2220,30 +2480,52 @@ class PaperScriptApp:
         self.prune_managed_jar_archive(plan.version, expected=plan.to_prune)
         return archived
 
-    def latest_stable_version(self) -> tuple[str, BuildInfo]:
-        versions = [item["id"] for item in self.api.get_project_versions()]
-        for version in versions:
-            build = self.api.get_latest_build(version, channel=self.check_latest_channel_only)
-            if build:
-                return version, build
-        raise PaperScriptError("No stable Paper builds were found.")
+    def latest_stable_version(self, *, use_cache: bool = True) -> tuple[str, BuildInfo]:
+        return self.latest_version_for_channel(
+            self.check_latest_channel_only,
+            use_cache=use_cache,
+        )
 
-    def latest_version_for_channel(self, channel: str) -> tuple[str, BuildInfo]:
+    def latest_version_for_channel(
+        self,
+        channel: str,
+        *,
+        use_cache: bool = True,
+    ) -> tuple[str, BuildInfo]:
         channel_upper = channel.upper()
-        versions = [item["id"] for item in self.api.get_project_versions()]
+        versions = [
+            item["id"]
+            for item in self.api.get_project_versions(use_cache=use_cache)
+        ]
         for version in versions:
-            build = self.api.get_latest_build(version, channel=channel_upper)
+            build = self.api.get_latest_build(
+                version,
+                channel=channel_upper,
+                use_cache=use_cache,
+            )
             if build:
                 return version, build
         raise PaperScriptError(f"No {channel_upper} Paper builds were found.")
 
-    def latest_preview_version(self, stable_version: str) -> tuple[str, BuildInfo] | None:
-        versions = [item["id"] for item in self.api.get_project_versions()]
+    def latest_preview_version(
+        self,
+        stable_version: str,
+        *,
+        use_cache: bool = True,
+    ) -> tuple[str, BuildInfo] | None:
+        versions = [
+            item["id"]
+            for item in self.api.get_project_versions(use_cache=use_cache)
+        ]
         for version in versions:
             if compare_versions(version, stable_version) <= 0:
                 continue
             for channel in ["BETA", "ALPHA"]:
-                build = self.api.get_latest_build(version, channel=channel)
+                build = self.api.get_latest_build(
+                    version,
+                    channel=channel,
+                    use_cache=use_cache,
+                )
                 if build:
                     return version, build
         return None
@@ -2368,6 +2650,8 @@ class PaperScriptApp:
                     by_channel[selected.upper()],
                     force_version_prompt=True,
                     prompt_for_forced_recheck=True,
+                    selection_policy=STAGE_SELECTION_LATEST_CHANNEL,
+                    required_channel=selected.upper(),
                 )
 
     def explore_versions(self) -> None:
@@ -2386,7 +2670,7 @@ class PaperScriptApp:
                 return
             self.console_only("Please enter one of the listed numbers.")
 
-    def choose_target_for_update(self) -> BuildInfo | None:
+    def choose_target_for_update(self, *, use_cache: bool = True) -> UpdateSelection | None:
         newest_managed = self.find_current_jar()
         try:
             current = self.last_launched_jar()
@@ -2408,14 +2692,19 @@ class PaperScriptApp:
                     else JarInfo(launcher_selection.path, launcher_selection.version, -1)
                 )
                 update_basis = "launcher-marked legacy family"
-        latest_overall_version, latest_overall_build = self.latest_stable_version()
+        latest_overall_version, latest_overall_build = self.latest_stable_version(
+            use_cache=use_cache,
+        )
 
         if current is None:
             self.logger.log(
                     f"No managed Paper jar detected. Latest stable is version {latest_overall_version} "
                 f"build #{latest_overall_build.build_id}."
             )
-            return latest_overall_build
+            return UpdateSelection(
+                latest_overall_build,
+                STAGE_SELECTION_LATEST_OVERALL,
+            )
 
         if current.version.casefold() == latest_overall_version.casefold():
             latest_build = latest_overall_build
@@ -2423,6 +2712,7 @@ class PaperScriptApp:
             latest_build = self.api.get_latest_build(
                 current.version,
                 channel=self.check_latest_channel_only,
+                use_cache=use_cache,
             )
             if latest_build is None:
                 self.logger.log(
@@ -2452,13 +2742,19 @@ class PaperScriptApp:
                 f"The {update_basis} server family is {current_description}. "
                 f"Latest stable build for that version is #{latest_build.build_id}."
             )
-            return latest_build
+            return UpdateSelection(
+                latest_build,
+                STAGE_SELECTION_LATEST_CHANNEL,
+            )
         if latest_build.build_id == current.build and self.args.force:
             self.logger.log(
                 f"The {update_basis} server family already has {current.version} build #{current.build}, "
                 "but --force was supplied, so PaperScript will re-check that build."
             )
-            return latest_build
+            return UpdateSelection(
+                latest_build,
+                STAGE_SELECTION_LATEST_CHANNEL,
+            )
         self.logger.log(
             f"The {update_basis} server family already has {current.version} build #{current.build}. "
             "No newer stable build is available, so no download was performed."
@@ -2731,8 +3027,15 @@ class PaperScriptApp:
         build: BuildInfo,
         force_version_prompt: bool = False,
         prompt_for_forced_recheck: bool = False,
+        selection_policy: str = STAGE_SELECTION_LATEST_CHANNEL,
+        required_channel: str | None = None,
     ) -> None:
         if self.args.dry_run:
+            build = self.revalidate_build_for_staging(
+                build,
+                selection_policy=selection_policy,
+                required_channel=required_channel,
+            )
             self._stage_build(
                 build,
                 force_version_prompt=force_version_prompt,
@@ -2740,11 +3043,87 @@ class PaperScriptApp:
             )
             return
         with self.server_mutation_lock():
+            build = self.revalidate_build_for_staging(
+                build,
+                selection_policy=selection_policy,
+                required_channel=required_channel,
+            )
             self._stage_build(
                 build,
                 force_version_prompt=force_version_prompt,
                 prompt_for_forced_recheck=prompt_for_forced_recheck,
             )
+
+    def revalidate_build_for_staging(
+        self,
+        selected: BuildInfo,
+        *,
+        selection_policy: str = STAGE_SELECTION_LATEST_CHANNEL,
+        required_channel: str | None = None,
+    ) -> BuildInfo:
+        """Recompute selection policy and artifact metadata from fresh Paper API data."""
+        self.stage_target_path(selected)
+        channel = str(required_channel or selected.channel).upper()
+        if selection_policy == STAGE_SELECTION_EXACT:
+            fresh = self.api.get_build_by_id(
+                selected.version,
+                selected.build_id,
+                use_cache=False,
+            )
+        elif selection_policy == STAGE_SELECTION_LATEST_CHANNEL:
+            fresh = self.api.get_latest_build(
+                selected.version,
+                channel=channel,
+                use_cache=False,
+            )
+        elif selection_policy == STAGE_SELECTION_LATEST_OVERALL:
+            _, fresh = self.latest_version_for_channel(
+                channel,
+                use_cache=False,
+            )
+        elif selection_policy == STAGE_SELECTION_LATEST_PREVIEW:
+            stable_version, _ = self.latest_stable_version(use_cache=False)
+            preview = self.latest_preview_version(
+                stable_version,
+                use_cache=False,
+            )
+            fresh = preview[1] if preview is not None else None
+        else:
+            raise PaperScriptError(
+                f"Unknown staging selection policy {selection_policy!r}; staging was refused."
+            )
+        if fresh is None:
+            raise PaperScriptError(
+                f"Paper staging selection {selected.version} build #{selected.build_id} "
+                f"({selection_policy}) could not be authenticated against a fresh Paper API response; "
+                "staging was refused."
+            )
+        if (
+            selection_policy
+            in {STAGE_SELECTION_LATEST_CHANNEL, STAGE_SELECTION_LATEST_OVERALL}
+            and fresh.channel.casefold() != channel.casefold()
+        ):
+            raise PaperScriptError(
+                f"Fresh Paper API selection returned channel {fresh.channel} while {channel} was required; "
+                "staging was refused."
+            )
+        self.stage_target_path(fresh)
+        require_artifact_metadata(fresh)
+        if (
+            fresh.version.casefold(),
+            fresh.build_id,
+            fresh.channel.casefold(),
+        ) != (
+            selected.version.casefold(),
+            selected.build_id,
+            selected.channel.casefold(),
+        ):
+            self.logger.log(
+                f"Fresh Paper API selection superseded cached metadata: "
+                f"{selected.version} #{selected.build_id} {selected.channel} -> "
+                f"{fresh.version} #{fresh.build_id} {fresh.channel}."
+            )
+        return fresh
 
     def _stage_build(
         self,
@@ -3041,31 +3420,54 @@ class PaperScriptApp:
     def run_update(self) -> None:
         self.describe_server_context()
         self.log_api_activity("Contacting Paper API for the latest stable release...")
-        target = self.choose_target_for_update()
-        if target is None:
+        selection = self.choose_target_for_update(use_cache=False)
+        if selection is None:
             self.logger.log("Update finished with no staging changes.")
             return
-        self.stage_build(target, force_version_prompt=False)
+        self.stage_build(
+            selection.build,
+            force_version_prompt=False,
+            selection_policy=selection.staging_policy,
+            required_channel=self.check_latest_channel_only,
+        )
 
     def run_download(self, version: str, build_id: int | None, channel: str) -> None:
         if build_id is not None:
-            builds = self.api.get_builds(version)
-            selected = next((build for build in builds if build.build_id == build_id), None)
+            selected = self.api.get_build_by_id(
+                version,
+                build_id,
+                use_cache=False,
+            )
             if not selected:
                 raise PaperScriptError(
                     f"Build #{build_id} was not found for version {version}. "
                     f"Try './paperscript.sh inspect {version}' to see the available builds first."
                 )
-            self.stage_build(selected, force_version_prompt=True, prompt_for_forced_recheck=True)
+            self.stage_build(
+                selected,
+                force_version_prompt=True,
+                prompt_for_forced_recheck=True,
+                selection_policy=STAGE_SELECTION_EXACT,
+            )
             return
 
-        selected = self.api.get_latest_build(version, channel=channel)
+        selected = self.api.get_latest_build(
+            version,
+            channel=channel,
+            use_cache=False,
+        )
         if not selected:
             raise PaperScriptError(
                 f"No {channel.upper()} build was found for version {version}. "
                 f"Try './paperscript.sh inspect {version}' to see which channels exist."
             )
-        self.stage_build(selected, force_version_prompt=True, prompt_for_forced_recheck=True)
+        self.stage_build(
+            selected,
+            force_version_prompt=True,
+            prompt_for_forced_recheck=True,
+            selection_policy=STAGE_SELECTION_LATEST_CHANNEL,
+            required_channel=channel,
+        )
 
     def run_status(self) -> None:
         compact = self.effective_status_view() == "compact"
@@ -3310,7 +3712,7 @@ class PaperScriptApp:
 
     def run_stable(self, download: bool = False) -> None:
         self.log_api_activity("Contacting Paper API for the latest stable release...")
-        version, build = self.latest_stable_version()
+        version, build = self.latest_stable_version(use_cache=not download)
         self.logger.log(f"Latest stable release overall: {version} build #{build.build_id} ({format_bytes(build.size)})")
         self.logger.log(f"Download URL: {build.download_url}")
         if build.sha256:
@@ -3320,12 +3722,21 @@ class PaperScriptApp:
         )
         self.log_release_page(relevant=True)
         if download:
-            self.stage_build(build, force_version_prompt=True, prompt_for_forced_recheck=True)
+            self.stage_build(
+                build,
+                force_version_prompt=True,
+                prompt_for_forced_recheck=True,
+                selection_policy=STAGE_SELECTION_LATEST_OVERALL,
+                required_channel=self.check_latest_channel_only,
+            )
 
     def run_experimental(self, download: bool = False) -> None:
         self.log_api_activity("Contacting Paper API for the latest preview release newer than stable...")
-        stable_version, stable_build = self.latest_stable_version()
-        preview = self.latest_preview_version(stable_version)
+        stable_version, stable_build = self.latest_stable_version(use_cache=not download)
+        preview = self.latest_preview_version(
+            stable_version,
+            use_cache=not download,
+        )
         if preview is None:
             self.logger.log(
                 f"No preview release newer than the current stable release was found. Stable is {stable_version} build #{stable_build.build_id}."
@@ -3348,63 +3759,213 @@ class PaperScriptApp:
         )
         self.log_release_page(relevant=True)
         if download:
-            self.stage_build(build, force_version_prompt=True, prompt_for_forced_recheck=True)
+            self.stage_build(
+                build,
+                force_version_prompt=True,
+                prompt_for_forced_recheck=True,
+                selection_policy=STAGE_SELECTION_LATEST_PREVIEW,
+            )
+
+    def open_verify_target(self, path: Path) -> tuple[int, os.stat_result]:
+        """Open the verify target without following a symlink and bind it to its path."""
+        flags = os.O_RDONLY
+        flags |= getattr(os, "O_NOFOLLOW", 0)
+        flags |= getattr(os, "O_CLOEXEC", 0)
+        try:
+            descriptor = os.open(path, flags)
+        except OSError as error:
+            raise PaperScriptError(
+                f"Could not safely open verify target {path}: {error}"
+            ) from error
+        try:
+            descriptor_stat = os.fstat(descriptor)
+            path_stat = path.lstat()
+            if (
+                not stat.S_ISREG(descriptor_stat.st_mode)
+                or not stat.S_ISREG(path_stat.st_mode)
+                or (path_stat.st_dev, path_stat.st_ino)
+                != (descriptor_stat.st_dev, descriptor_stat.st_ino)
+            ):
+                raise PaperScriptError(
+                    f"Verify target {path} changed identity or is not a regular non-symlink file."
+                )
+            return descriptor, descriptor_stat
+        except BaseException:
+            os.close(descriptor)
+            raise
+
+    def assert_verify_target_unchanged(
+        self,
+        path: Path,
+        descriptor: int,
+        expected: os.stat_result,
+    ) -> None:
+        """Require the path and opened verify inode to remain stable through the check."""
+        try:
+            descriptor_stat = os.fstat(descriptor)
+            path_stat = path.lstat()
+        except OSError as error:
+            raise PaperScriptError(
+                f"Verify target {path} changed identity or disappeared during verification: {error}"
+            ) from error
+        expected_identity = (
+            expected.st_dev,
+            expected.st_ino,
+            expected.st_size,
+            expected.st_mtime_ns,
+            expected.st_ctime_ns,
+        )
+        descriptor_identity = (
+            descriptor_stat.st_dev,
+            descriptor_stat.st_ino,
+            descriptor_stat.st_size,
+            descriptor_stat.st_mtime_ns,
+            descriptor_stat.st_ctime_ns,
+        )
+        if (
+            not stat.S_ISREG(descriptor_stat.st_mode)
+            or not stat.S_ISREG(path_stat.st_mode)
+            or (path_stat.st_dev, path_stat.st_ino)
+            != (descriptor_stat.st_dev, descriptor_stat.st_ino)
+            or descriptor_identity != expected_identity
+        ):
+            raise PaperScriptError(
+                f"Verify target {path} changed identity or contents during verification."
+            )
 
     def run_verify(self) -> None:
+        with self.server_mutation_lock():
+            self._run_verify_locked()
+
+    def _run_verify_locked(self) -> None:
         current = self.find_current_jar()
         if not current:
             raise PaperScriptError("No managed Paper jar was detected to verify.")
 
-        current_sha = sha256_file(current.path)
-        self.logger.log(
-            f"Verify target: {current.path.name} (version {current.version}, build #{current.build})"
-        )
-        self.logger.log(f"Newest managed SHA-256: {current_sha}")
-
-        state_jar = self.state.get("staged_jar") or self.state.get("current_jar")
-        state_channel = self.state.get("staged_channel") or self.state.get("current_channel")
-        state_expected = self.state.get("expected_sha256")
-        state_current = self.state.get("staged_sha256") or self.state.get("current_sha256")
-        if state_jar == current.path.name:
-            if state_channel:
-                self.logger.log(f"Recorded staging channel: {str(state_channel).upper()}")
-            if not state_current and not state_expected:
-                self.logger.log("Recorded staging state exists for this jar, but it does not contain stored SHA-256 values yet.")
-            if state_current:
-                self.logger.log(f"Recorded SHA-256 from staging time: {state_current}")
-                self.logger.log(
-                    f"Newest managed SHA-256 matches recorded staging SHA: "
-                    f"{format_bool(current_sha.lower() == str(state_current).lower())}"
-                )
-            if state_expected:
-                self.logger.log(f"Recorded expected SHA-256: {state_expected}")
-                self.logger.log(
-                    f"Newest managed SHA-256 matches recorded expected SHA: "
-                    f"{format_bool(current_sha.lower() == str(state_expected).lower())}"
-                )
-        else:
-            self.logger.log("Recorded staging state does not match the currently detected jar, so local state comparison is unavailable.")
-
-        api_build: BuildInfo | None = None
+        descriptor, target_identity = self.open_verify_target(current.path)
         try:
-            api_build = self.api.get_build_by_id(current.version, current.build)
-        except PaperScriptError as error:
-            self.logger.log(f"API checksum lookup unavailable: {error}")
-
-        if api_build is None:
-            self.logger.log("API checksum verification: unavailable for this jar or the API could not be reached.")
-            return
-
-        self.logger.log(f"API channel: {api_build.channel}")
-        self.logger.log(f"API download URL: {api_build.download_url}")
-        if api_build.sha256:
-            self.logger.log(f"API expected SHA-256: {api_build.sha256}")
-            self.logger.log(
-                f"Newest managed SHA-256 matches API expected SHA: "
-                f"{format_bool(current_sha.lower() == api_build.sha256.lower())}"
+            current_sha = sha256_descriptor(descriptor)
+            self.assert_verify_target_unchanged(
+                current.path,
+                descriptor,
+                target_identity,
             )
-        else:
-            self.logger.log("API checksum verification: this build did not include a SHA-256 in the API response.")
+            self.logger.log(
+                f"Verify target: {current.path.name} (version {current.version}, build #{current.build})"
+            )
+            self.logger.log(f"Newest managed SHA-256: {current_sha}")
+
+            state_jar = self.state.get("staged_jar") or self.state.get("current_jar")
+            state_channel = self.state.get("staged_channel") or self.state.get("current_channel")
+            state_expected = self.state.get("expected_sha256")
+            state_current = self.state.get("staged_sha256")
+            if state_current is None or state_current == "":
+                state_current = self.state.get("current_sha256")
+            if state_jar == current.path.name:
+                if state_channel:
+                    self.logger.log(f"Recorded staging channel: {str(state_channel).upper()}")
+                if not state_current and not state_expected:
+                    self.logger.log(
+                        "Recorded staging state exists for this jar, but it does not contain stored SHA-256 values yet."
+                    )
+                state_checks = (
+                    (
+                        "staging",
+                        "Recorded SHA-256 from staging time",
+                        "Newest managed SHA-256 matches recorded staging SHA",
+                        state_current,
+                    ),
+                    (
+                        "expected",
+                        "Recorded expected SHA-256",
+                        "Newest managed SHA-256 matches recorded expected SHA",
+                        state_expected,
+                    ),
+                )
+                for state_label, value_label, match_label, recorded_value in state_checks:
+                    if recorded_value is None or recorded_value == "":
+                        continue
+                    recorded_sha = normalized_sha256(recorded_value)
+                    if recorded_sha is None:
+                        raise PaperScriptError(
+                            f"Verification failed: recorded {state_label} SHA-256 is invalid for {current.path.name}."
+                        )
+                    self.logger.log(f"{value_label}: {recorded_sha}")
+                    state_matches = secrets.compare_digest(current_sha, recorded_sha)
+                    self.logger.log(f"{match_label}: {format_bool(state_matches)}")
+                    if not state_matches:
+                        raise PaperScriptError(
+                            f"Verification failed: {current.path.name} does not match the recorded "
+                            f"{state_label} SHA-256."
+                        )
+            else:
+                self.logger.log(
+                    "Recorded staging state does not match the currently detected jar, so local state comparison is unavailable."
+                )
+
+            try:
+                api_build = self.api.get_build_by_id(
+                    current.version,
+                    current.build,
+                    use_cache=False,
+                )
+            except PaperScriptError as error:
+                raise PaperScriptError(
+                    f"Fresh API checksum lookup failed for {current.path.name}: {error}"
+                ) from error
+
+            if api_build is None:
+                raise PaperScriptError(
+                    f"Verification failed: exact build {current.version} #{current.build} "
+                    "was not found by the fresh Paper API lookup."
+                )
+
+            api_sha = normalized_sha256(api_build.sha256)
+            if api_sha is None:
+                raise PaperScriptError(
+                    f"Verification failed: the fresh Paper API did not provide a valid SHA-256 "
+                    f"for {current.path.name}."
+                )
+
+            self.logger.log(f"API channel: {api_build.channel}")
+            self.logger.log(f"API download URL: {api_build.download_url}")
+            self.logger.log(f"API expected SHA-256: {api_sha}")
+            api_matches = secrets.compare_digest(current_sha, api_sha)
+            self.logger.log(
+                f"Newest managed SHA-256 matches API expected SHA: {format_bool(api_matches)}"
+            )
+            if not api_matches:
+                raise PaperScriptError(
+                    f"Verification failed: {current.path.name} does not match the fresh Paper API SHA-256."
+                )
+
+            self.assert_verify_target_unchanged(
+                current.path,
+                descriptor,
+                target_identity,
+            )
+            final_current = self.find_current_jar()
+            if (
+                final_current is None
+                or final_current.path != current.path
+                or final_current.version != current.version
+                or final_current.build != current.build
+            ):
+                final_name = final_current.path.name if final_current is not None else "none"
+                raise PaperScriptError(
+                    f"Verification failed: {current.path.name} is no longer the newest managed jar "
+                    f"(current selection: {final_name})."
+                )
+            self.assert_verify_target_unchanged(
+                current.path,
+                descriptor,
+                target_identity,
+            )
+            self.logger.log(
+                "Verification succeeded: newest managed jar matches the fresh Paper API SHA-256."
+            )
+        finally:
+            os.close(descriptor)
 
     def cleanup_selection(self) -> dict[str, bool]:
         selected = {
@@ -3510,7 +4071,10 @@ class PaperScriptApp:
 
     def console_only(self, message: str) -> None:
         if not self.logger.quiet:
-            print(message)
+            if isinstance(message, StyledConsoleText):
+                print(str(message))
+            else:
+                print(terminal_safe_text(message))
 
     def run_init(self) -> None:
         actions: list[str] = []
@@ -3783,7 +4347,13 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Force the full status view even if config defaults to compact.",
     )
-    subparsers.add_parser("verify", help="Verify the newest managed jar SHA-256 against recorded state and the live API when available.")
+    subparsers.add_parser(
+        "verify",
+        help=(
+            "Fail closed unless the newest managed jar matches its recorded digests and "
+            "a fresh exact-build Paper API SHA-256."
+        ),
+    )
     stable_parser = subparsers.add_parser(
         "stable",
         help="Show and optionally stage the latest stable Paper release overall.",
@@ -3970,7 +4540,7 @@ def main() -> int:
     except PaperScriptError as error:
         print(
             color_text(
-                f"Error: {error}",
+                terminal_safe_text(f"Error: {error}"),
                 ANSI_RED,
                 supports_color(sys.stderr, no_color=bool(getattr(args, "no_color", False))),
                 bold=True,

@@ -55,6 +55,30 @@ def executable_jar_bytes(payload: bytes = b"fixture") -> bytes:
     return output.getvalue()
 
 
+def fill_build_payload(build: paperscript.BuildInfo) -> dict[str, object]:
+    return {
+        "builds": [
+            {
+                "id": build.build_id,
+                "channel": build.channel,
+                "createdAt": build.created_at,
+                "downloads": {
+                    "server:default": {
+                        "name": build.download_name,
+                        "url": build.download_url,
+                        "checksums": {"sha256": build.sha256},
+                        "size": build.size,
+                    }
+                },
+            }
+        ]
+    }
+
+
+def contains_terminal_control(text: str) -> bool:
+    return any(ord(character) < 0x20 or 0x7F <= ord(character) <= 0x9F for character in text)
+
+
 class RecordingLogger:
     def __init__(self) -> None:
         self.messages: list[str] = []
@@ -149,6 +173,272 @@ class PaperAPIDownloadSafetyTests(unittest.TestCase):
                 self.assertEqual(verification.sha256, build.sha256)
             finally:
                 paperscript.os.close(descriptor)
+
+
+class PaperAPICacheSafetyTests(unittest.TestCase):
+    def make_api(self, directory: str) -> paperscript.PaperAPI:
+        return paperscript.PaperAPI(
+            "test-agent/1.0 (https://example.invalid)",
+            cache_dir=Path(directory) / "cache",
+            cache_ttl_seconds=300,
+            cache_enabled=True,
+        )
+
+    def write_cache(
+        self,
+        api: paperscript.PaperAPI,
+        label: str,
+        cached_at_epoch: object,
+        data: object,
+    ) -> Path:
+        path = api._cache_path(label)
+        if path is None:
+            raise AssertionError("cache unexpectedly disabled")
+        path.write_text(
+            json.dumps(
+                {
+                    "cached_at": "fixture",
+                    "cached_at_epoch": cached_at_epoch,
+                    "data": data,
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        path.chmod(0o600)
+        return path
+
+    def test_future_cache_cannot_override_fresh_build_metadata(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            api = self.make_api(directory)
+            forged = build_info()
+            forged.download_url = "https://attacker.invalid/forged.jar"
+            forged.sha256 = "f" * 64
+            authoritative = build_info()
+            authoritative.download_url = "https://downloads.example.invalid/authentic.jar"
+            authoritative.sha256 = "b" * 64
+            self.write_cache(
+                api,
+                "builds-26.2",
+                paperscript.time.time() + 86_400,
+                fill_build_payload(forged),
+            )
+
+            with mock.patch.object(
+                api,
+                "_request_json",
+                return_value=fill_build_payload(authoritative),
+            ) as request_json:
+                selected = api.get_builds("26.2")
+
+            request_json.assert_called_once()
+            self.assertEqual(selected[0].download_url, authoritative.download_url)
+            self.assertEqual(selected[0].sha256, authoritative.sha256)
+
+    def test_invalid_cache_timestamps_are_rejected(self) -> None:
+        invalid_timestamps = (
+            float("nan"),
+            float("inf"),
+            float("-inf"),
+            True,
+            10**400,
+        )
+        for cached_at in invalid_timestamps:
+            with self.subTest(cached_at=cached_at), tempfile.TemporaryDirectory() as directory:
+                api = self.make_api(directory)
+                self.write_cache(api, "versions", cached_at, {"sentinel": True})
+                self.assertIsNone(api._load_cache("versions"))
+
+    def test_cache_load_rejects_symlink_and_group_writable_leaf(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            api = self.make_api(directory)
+            cache_path = api._cache_path("versions")
+            if cache_path is None:
+                raise AssertionError("cache unexpectedly disabled")
+            victim = Path(directory) / "victim.json"
+            victim.write_text(
+                json.dumps(
+                    {
+                        "cached_at_epoch": paperscript.time.time(),
+                        "data": {"sentinel": True},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            cache_path.symlink_to(victim)
+
+            self.assertIsNone(api._load_cache("versions"))
+
+            cache_path.unlink()
+            self.write_cache(
+                api,
+                "versions",
+                paperscript.time.time(),
+                {"sentinel": True},
+            ).chmod(0o660)
+            self.assertIsNone(api._load_cache("versions"))
+
+    def test_cache_is_disabled_for_group_writable_or_symlinked_directory(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            api = self.make_api(directory)
+            cache_dir = Path(directory) / "cache"
+            cache_dir.mkdir(mode=0o700)
+            cache_dir.chmod(0o770)
+            self.assertIsNone(api._cache_path("versions"))
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            redirected = root / "redirected"
+            redirected.mkdir()
+            (root / "cache").symlink_to(redirected, target_is_directory=True)
+            api = self.make_api(directory)
+            self.assertIsNone(api._cache_path("versions"))
+
+    def test_cache_save_replaces_symlink_without_touching_target(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            api = self.make_api(directory)
+            cache_path = api._cache_path("versions")
+            if cache_path is None:
+                raise AssertionError("cache unexpectedly disabled")
+            victim = Path(directory) / "victim.json"
+            victim.write_text("do not overwrite\n", encoding="utf-8")
+            cache_path.symlink_to(victim)
+
+            api._save_cache("versions", {"fresh": True})
+
+            self.assertEqual(victim.read_text(encoding="utf-8"), "do not overwrite\n")
+            self.assertTrue(cache_path.is_file())
+            self.assertFalse(cache_path.is_symlink())
+            self.assertEqual(cache_path.stat().st_mode & 0o777, 0o600)
+            self.assertEqual(json.loads(cache_path.read_text(encoding="utf-8"))["data"], {"fresh": True})
+
+            cache_path.unlink()
+            missing_target = Path(directory) / "must-not-be-created.json"
+            cache_path.symlink_to(missing_target)
+            api._save_cache("versions", {"second": True})
+            self.assertFalse(missing_target.exists())
+            self.assertTrue(cache_path.is_file())
+            self.assertFalse(cache_path.is_symlink())
+
+    def test_cache_save_stays_on_open_directory_when_path_is_swapped(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            api = self.make_api(directory)
+            cache_path = api._cache_path("versions")
+            if cache_path is None:
+                raise AssertionError("cache unexpectedly disabled")
+            original_cache_dir = root / "cache"
+            retained_cache_dir = root / "retained-cache"
+            redirected_dir = root / "redirected"
+            redirected_dir.mkdir()
+            real_atomic_write = paperscript.atomic_write_cache_text
+
+            def swap_directory_before_write(
+                directory_descriptor: int,
+                leaf_name: str,
+                content: str,
+                mode: int = 0o600,
+            ) -> None:
+                original_cache_dir.rename(retained_cache_dir)
+                original_cache_dir.symlink_to(redirected_dir, target_is_directory=True)
+                real_atomic_write(directory_descriptor, leaf_name, content, mode)
+
+            with mock.patch.object(
+                paperscript,
+                "atomic_write_cache_text",
+                side_effect=swap_directory_before_write,
+            ):
+                api._save_cache("versions", {"fresh": True})
+
+            self.assertFalse((redirected_dir / "versions.json").exists())
+            retained_payload = json.loads(
+                (retained_cache_dir / "versions.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(retained_payload["data"], {"fresh": True})
+
+    def test_build_lookup_rejects_unsafe_version_before_request(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            api = self.make_api(directory)
+            with mock.patch.object(api, "_request_json") as request_json:
+                with self.assertRaisesRegex(paperscript.PaperScriptError, "Unsafe Paper version"):
+                    api.get_builds("26.2/../../outside", use_cache=False)
+            request_json.assert_not_called()
+
+
+class TerminalOutputSafetyTests(unittest.TestCase):
+    def test_terminal_safe_text_escapes_every_control_range(self) -> None:
+        untrusted = "prefix\x1b[31mred\x1b]52;c;secret\x07\nnext\rline\tend\b\x00\x7f\x85"
+
+        rendered = paperscript.terminal_safe_text(untrusted)
+
+        self.assertFalse(contains_terminal_control(rendered))
+        for visible_escape in (r"\x1b", r"\x07", r"\n", r"\r", r"\t", r"\x08", r"\x00", r"\x7f", r"\x85"):
+            self.assertIn(visible_escape, rendered)
+
+    def test_http_detail_and_logger_neutralize_multiline_terminal_payloads(self) -> None:
+        untrusted = "API\x1b]8;;https://attacker.invalid\x07link\x1b]8;;\x07\nsecond line\rreset"
+        summary = paperscript.summarize_http_detail(untrusted)
+        self.assertFalse(contains_terminal_control(summary))
+        self.assertIn(r"\x1b", summary)
+        self.assertIn(r"\x07", summary)
+
+        with tempfile.TemporaryDirectory() as directory:
+            log_path = Path(directory) / "logs.log"
+            logger = paperscript.Logger(log_path, use_color=False)
+            with mock.patch("builtins.print") as print_message:
+                logger.log(untrusted)
+
+            console_text = print_message.call_args.args[0]
+            durable_text = log_path.read_text(encoding="utf-8")
+            self.assertFalse(contains_terminal_control(console_text))
+            self.assertFalse(contains_terminal_control(durable_text.rstrip("\n")))
+            self.assertEqual(len(durable_text.splitlines()), 1)
+            self.assertIn(r"\x1b", console_text)
+            self.assertIn(r"\n", durable_text)
+
+    def test_owned_colors_survive_while_untrusted_escape_sequences_do_not(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            log_path = Path(directory) / "logs.log"
+            logger = paperscript.Logger(log_path, use_color=True)
+            app = object.__new__(paperscript.PaperScriptApp)
+            app.logger = logger
+            malicious_value = "release\x1b]52;c;secret\x07"
+
+            styled = app.format_browser_entry("  - ", malicious_value, " (stable)")
+
+            self.assertIsInstance(styled, paperscript.StyledConsoleText)
+            with mock.patch("builtins.print") as print_message:
+                logger.log(styled)
+
+            console_text = print_message.call_args.args[0]
+            durable_text = log_path.read_text(encoding="utf-8")
+            self.assertIn("\x1b[", console_text)
+            self.assertNotIn("\x1b]52", console_text)
+            self.assertIn(r"\x1b]52", console_text)
+            self.assertFalse(contains_terminal_control(durable_text.rstrip("\n")))
+            self.assertNotIn("\x1b[", durable_text)
+            self.assertIn(r"\x1b]52", durable_text)
+
+    def test_top_level_stderr_neutralizes_remote_exception_text(self) -> None:
+        untrusted = "failure\x1b]52;c;secret\x07\nforged line\rreturn\b"
+        stderr = io.StringIO()
+        with mock.patch.object(
+            paperscript,
+            "PaperScriptApp",
+            side_effect=paperscript.PaperScriptError(untrusted),
+        ), mock.patch.object(
+            sys,
+            "argv",
+            ["paperscript.py", "--no-color", "status"],
+        ), mock.patch.object(sys, "stderr", stderr):
+            exit_code = paperscript.main()
+
+        rendered = stderr.getvalue()
+        self.assertEqual(exit_code, 1)
+        self.assertFalse(contains_terminal_control(rendered.rstrip("\n")))
+        self.assertEqual(len(rendered.splitlines()), 1)
+        self.assertIn(r"\x1b", rendered)
+        self.assertIn(r"\n", rendered)
 
 
 class ReleaseAndConfigTests(unittest.TestCase):
@@ -452,6 +742,323 @@ class DetectionAndStateTests(unittest.TestCase):
             self.assertEqual(saved["staged_version"], "26.2")
             self.assertEqual(saved["staged_build"], 84)
             self.assertNotIn("current_jar", saved)
+
+
+class VerifyCommandTests(unittest.TestCase):
+    def make_app(
+        self,
+        directory: str,
+        *,
+        content: bytes = b"authentic Paper jar bytes",
+        filename: str = "Paper-26.2-84.jar",
+        state: dict[str, object] | None = None,
+    ) -> tuple[paperscript.PaperScriptApp, Path, paperscript.BuildInfo]:
+        jar_path = Path(directory) / filename
+        jar_path.write_bytes(content)
+        app = object.__new__(paperscript.PaperScriptApp)
+        app.server_dir = Path(directory)
+        app.server_runtime_dir = app.server_dir / "paperscript"
+        app.server_lock_path = app.server_runtime_dir / "locks" / "paper-jars.lock"
+        app.state = dict(state or {})
+        app.logger = RecordingLogger()
+        authoritative = build_info()
+        authoritative.sha256 = paperscript.hashlib.sha256(content).hexdigest()
+        app.api = mock.Mock()
+        app.api.get_build_by_id.return_value = authoritative
+        return app, jar_path, authoritative
+
+    def test_success_requires_fresh_exact_api_checksum(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            app, jar_path, authoritative = self.make_app(directory)
+            authoritative.sha256 = str(authoritative.sha256).upper()
+            app.state = {
+                "staged_jar": jar_path.name,
+                "staged_sha256": authoritative.sha256,
+                "expected_sha256": authoritative.sha256,
+            }
+
+            app.run_verify()
+
+            app.api.get_build_by_id.assert_called_once_with(
+                "26.2",
+                84,
+                use_cache=False,
+            )
+            self.assertIn(
+                "Verification succeeded: newest managed jar matches the fresh Paper API SHA-256.",
+                app.logger.messages,
+            )
+
+    def test_api_outage_fails_instead_of_accepting_local_state(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            app, jar_path, authoritative = self.make_app(directory)
+            app.state = {
+                "staged_jar": jar_path.name,
+                "staged_sha256": authoritative.sha256,
+                "expected_sha256": authoritative.sha256,
+            }
+            app.api.get_build_by_id.side_effect = paperscript.PaperScriptError(
+                "simulated Paper API outage"
+            )
+
+            with self.assertRaisesRegex(
+                paperscript.PaperScriptError,
+                "Fresh API checksum lookup failed",
+            ):
+                app.run_verify()
+
+    def test_missing_exact_api_build_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            app, _, _ = self.make_app(directory)
+            app.api.get_build_by_id.return_value = None
+
+            with self.assertRaisesRegex(
+                paperscript.PaperScriptError,
+                "exact build.*was not found",
+            ):
+                app.run_verify()
+
+    def test_missing_or_malformed_api_checksum_fails(self) -> None:
+        invalid_values: tuple[object, ...] = (
+            None,
+            "",
+            "a" * 63,
+            "g" * 64,
+            123,
+        )
+        for invalid in invalid_values:
+            with self.subTest(invalid=invalid), tempfile.TemporaryDirectory() as directory:
+                app, _, authoritative = self.make_app(directory)
+                authoritative.sha256 = invalid  # type: ignore[assignment]
+
+                with self.assertRaisesRegex(
+                    paperscript.PaperScriptError,
+                    "valid SHA-256",
+                ):
+                    app.run_verify()
+
+    def test_api_checksum_mismatch_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            app, _, authoritative = self.make_app(directory)
+            authoritative.sha256 = "f" * 64
+
+            with self.assertRaisesRegex(
+                paperscript.PaperScriptError,
+                "does not match the fresh Paper API SHA-256",
+            ):
+                app.run_verify()
+
+    def test_forged_warm_cache_cannot_authorize_checksum(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            app, _, cached = self.make_app(directory)
+            api = paperscript.PaperAPI(
+                "test-agent/1.0 (https://example.invalid)",
+                cache_dir=app.server_runtime_dir / "cache",
+                cache_ttl_seconds=300,
+                cache_enabled=True,
+            )
+            api._save_cache("builds-26.2", fill_build_payload(cached))
+            fresh = build_info()
+            fresh.sha256 = "f" * 64
+            app.api = api
+
+            with mock.patch.object(
+                api,
+                "_request_json",
+                return_value=fill_build_payload(fresh),
+            ) as request_json:
+                with self.assertRaisesRegex(
+                    paperscript.PaperScriptError,
+                    "does not match the fresh Paper API SHA-256",
+                ):
+                    app.run_verify()
+
+            request_json.assert_called_once_with(
+                f"{paperscript.API_ROOT}/versions/26.2/builds"
+            )
+
+    def test_matching_target_state_digest_claims_fail_independently(self) -> None:
+        for field in ("staged_sha256", "expected_sha256"):
+            with self.subTest(field=field), tempfile.TemporaryDirectory() as directory:
+                app, jar_path, authoritative = self.make_app(directory)
+                app.state = {
+                    "staged_jar": jar_path.name,
+                    "staged_sha256": authoritative.sha256,
+                    "expected_sha256": authoritative.sha256,
+                    field: "f" * 64,
+                }
+
+                with self.assertRaisesRegex(
+                    paperscript.PaperScriptError,
+                    "recorded .* SHA-256",
+                ):
+                    app.run_verify()
+
+    def test_malformed_matching_target_state_digest_fails(self) -> None:
+        for invalid in ("not-a-digest", 0, False):
+            with self.subTest(invalid=invalid), tempfile.TemporaryDirectory() as directory:
+                app, jar_path, _ = self.make_app(directory)
+                app.state = {
+                    "staged_jar": jar_path.name,
+                    "staged_sha256": invalid,
+                }
+
+                with self.assertRaisesRegex(
+                    paperscript.PaperScriptError,
+                    "recorded staging SHA-256 is invalid",
+                ):
+                    app.run_verify()
+
+    def test_optional_or_unrelated_state_does_not_replace_fresh_api_trust(self) -> None:
+        states = (
+            {},
+            {
+                "staged_jar": "Paper-26.1-1.jar",
+                "staged_sha256": "f" * 64,
+            },
+            {
+                "staged_jar": "Paper-26.2-84.jar",
+                "staged_channel": "BETA",
+            },
+        )
+        for state in states:
+            with self.subTest(state=state), tempfile.TemporaryDirectory() as directory:
+                app, _, _ = self.make_app(directory, state=state)
+
+                app.run_verify()
+
+                app.api.get_build_by_id.assert_called_once_with(
+                    "26.2",
+                    84,
+                    use_cache=False,
+                )
+
+    def test_legacy_state_identified_jar_remains_verifiable(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            state = {
+                "current_jar": "Paper-26.2.jar",
+                "current_version": "26.2",
+                "current_build": 84,
+                "current_channel": "STABLE",
+            }
+            app, _, _ = self.make_app(
+                directory,
+                filename="Paper-26.2.jar",
+                state=state,
+            )
+
+            app.run_verify()
+
+            app.api.get_build_by_id.assert_called_once_with(
+                "26.2",
+                84,
+                use_cache=False,
+            )
+
+    def test_path_replacement_during_verification_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            app, jar_path, _ = self.make_app(directory)
+            original_sha256_descriptor = paperscript.sha256_descriptor
+
+            def replace_path_after_hash(descriptor: int) -> str:
+                digest = original_sha256_descriptor(descriptor)
+                jar_path.rename(jar_path.with_suffix(".replaced"))
+                jar_path.write_bytes(b"replacement bytes")
+                return digest
+
+            with mock.patch.object(
+                paperscript,
+                "sha256_descriptor",
+                side_effect=replace_path_after_hash,
+            ):
+                with self.assertRaisesRegex(
+                    paperscript.PaperScriptError,
+                    "changed identity",
+                ):
+                    app.run_verify()
+
+            app.api.get_build_by_id.assert_not_called()
+
+    def test_path_replacement_during_fresh_api_lookup_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            app, jar_path, authoritative = self.make_app(directory)
+
+            def replace_path_during_lookup(*args: object, **kwargs: object) -> paperscript.BuildInfo:
+                jar_path.rename(jar_path.with_suffix(".replaced"))
+                jar_path.write_bytes(b"replacement bytes")
+                return authoritative
+
+            app.api.get_build_by_id.side_effect = replace_path_during_lookup
+
+            with self.assertRaisesRegex(
+                paperscript.PaperScriptError,
+                "changed identity",
+            ):
+                app.run_verify()
+
+    def test_in_place_mutation_during_fresh_api_lookup_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            app, jar_path, authoritative = self.make_app(directory)
+
+            def mutate_during_lookup(*args: object, **kwargs: object) -> paperscript.BuildInfo:
+                jar_path.write_bytes(b"mutated in place")
+                return authoritative
+
+            app.api.get_build_by_id.side_effect = mutate_during_lookup
+
+            with self.assertRaisesRegex(
+                paperscript.PaperScriptError,
+                "changed identity or contents",
+            ):
+                app.run_verify()
+
+    def test_newer_managed_jar_appearing_during_lookup_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            app, _, authoritative = self.make_app(directory)
+
+            def publish_newer_during_lookup(*args: object, **kwargs: object) -> paperscript.BuildInfo:
+                (app.server_dir / "Paper-26.2-85.jar").write_bytes(b"unverified newer jar")
+                return authoritative
+
+            app.api.get_build_by_id.side_effect = publish_newer_during_lookup
+
+            with self.assertRaisesRegex(
+                paperscript.PaperScriptError,
+                "no longer the newest managed jar",
+            ):
+                app.run_verify()
+
+    def test_verify_fails_while_server_mutation_lock_is_held(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            app, _, _ = self.make_app(directory)
+
+            with app.server_mutation_lock():
+                with self.assertRaisesRegex(
+                    paperscript.PaperScriptError,
+                    "already running",
+                ):
+                    app.run_verify()
+
+            app.api.get_build_by_id.assert_not_called()
+
+    def test_main_maps_verification_failure_to_nonzero_status(self) -> None:
+        stderr = io.StringIO()
+        with mock.patch.object(
+            paperscript,
+            "PaperScriptApp",
+        ) as app_class, mock.patch.object(
+            sys,
+            "argv",
+            ["paperscript.py", "--no-color", "verify"],
+        ), mock.patch.object(sys, "stderr", stderr):
+            app_class.return_value.run_verify.side_effect = paperscript.PaperScriptError(
+                "verification failed"
+            )
+
+            exit_code = paperscript.main()
+
+        self.assertEqual(exit_code, 1)
+        self.assertIn("verification failed", stderr.getvalue())
 
 
 class ServerJarRetentionTests(unittest.TestCase):
@@ -903,7 +1510,333 @@ class NonDisruptiveStagingTests(unittest.TestCase):
                 )
 
         app.api = FakeAPI()
+        # Existing staging tests isolate post-authorization behavior. Dedicated tests below
+        # bind the production revalidation method and exercise the fresh API boundary.
+        app.revalidate_build_for_staging = lambda selected, **kwargs: selected
         return app, build
+
+    def bind_production_revalidation(self, app: paperscript.PaperScriptApp) -> None:
+        app.revalidate_build_for_staging = (
+            paperscript.PaperScriptApp.revalidate_build_for_staging.__get__(
+                app,
+                paperscript.PaperScriptApp,
+            )
+        )
+
+    def test_staging_replaces_cached_metadata_with_fresh_exact_build(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            content = executable_jar_bytes(b"freshly authorized paper jar")
+            app, cached = self.make_app(directory, content, marker=None)
+            cached.download_url = "https://attacker.invalid/cache-selected.jar"
+            cached.sha256 = "f" * 64
+            cached.size = 1
+            fresh = paperscript.BuildInfo(
+                version=cached.version,
+                build_id=cached.build_id,
+                channel=cached.channel,
+                download_name="paper-26.2-11.jar",
+                download_url="https://downloads.example.invalid/authentic.jar",
+                sha256=paperscript.hashlib.sha256(content).hexdigest(),
+                size=len(content),
+                created_at="2026-08-30T00:00:00Z",
+            )
+
+            class FreshAPI:
+                lookup: tuple[str, int, bool] | None = None
+                downloaded: paperscript.BuildInfo | None = None
+
+                def get_build_by_id(
+                    self,
+                    version: str,
+                    build_id: int,
+                    *,
+                    use_cache: bool = True,
+                ) -> paperscript.BuildInfo:
+                    self.lookup = (version, build_id, use_cache)
+                    return fresh
+
+                def download_file(
+                    self,
+                    selected: paperscript.BuildInfo,
+                    destination: Path,
+                    destination_descriptor: int | None = None,
+                ) -> paperscript.DownloadVerification:
+                    self.downloaded = selected
+                    destination.write_bytes(content)
+                    return paperscript.DownloadVerification(
+                        sha256=fresh.sha256 or "",
+                        bytes_written=len(content),
+                        elapsed_seconds=0.01,
+                    )
+
+            api = FreshAPI()
+            app.api = api
+            self.bind_production_revalidation(app)
+
+            app.stage_build(
+                cached,
+                selection_policy=paperscript.STAGE_SELECTION_EXACT,
+            )
+
+            self.assertEqual(api.lookup, ("26.2", 11, False))
+            self.assertIs(api.downloaded, fresh)
+            self.assertEqual(
+                (app.server_dir / "Paper-26.2-11.jar").read_bytes(),
+                content,
+            )
+
+    def test_latest_channel_staging_supersedes_stale_cached_build_selection(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            content = executable_jar_bytes(b"fresh latest channel build")
+            app, cached = self.make_app(directory, content, marker=None)
+            fresh = paperscript.BuildInfo(
+                version="26.2",
+                build_id=12,
+                channel="STABLE",
+                download_name="paper-26.2-12.jar",
+                download_url="https://downloads.example.invalid/paper-26.2-12.jar",
+                sha256=paperscript.hashlib.sha256(content).hexdigest(),
+                size=len(content),
+                created_at="2026-08-30T01:00:00Z",
+            )
+
+            class LatestAPI:
+                request: tuple[str, str, bool] | None = None
+
+                def get_latest_build(
+                    self,
+                    version: str,
+                    channel: str,
+                    *,
+                    use_cache: bool = True,
+                ) -> paperscript.BuildInfo:
+                    self.request = (version, channel, use_cache)
+                    return fresh
+
+                def download_file(
+                    self,
+                    selected: paperscript.BuildInfo,
+                    destination: Path,
+                    destination_descriptor: int | None = None,
+                ) -> paperscript.DownloadVerification:
+                    destination.write_bytes(content)
+                    return paperscript.DownloadVerification(
+                        sha256=fresh.sha256 or "",
+                        bytes_written=len(content),
+                        elapsed_seconds=0.01,
+                    )
+
+            api = LatestAPI()
+            app.api = api
+            self.bind_production_revalidation(app)
+
+            app.stage_build(
+                cached,
+                selection_policy=paperscript.STAGE_SELECTION_LATEST_CHANNEL,
+                required_channel="STABLE",
+            )
+
+            self.assertEqual(api.request, ("26.2", "STABLE", False))
+            self.assertFalse((app.server_dir / "Paper-26.2-11.jar").exists())
+            self.assertEqual(
+                (app.server_dir / "Paper-26.2-12.jar").read_bytes(),
+                content,
+            )
+
+    def test_latest_overall_staging_supersedes_stale_cached_family_selection(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            content = executable_jar_bytes(b"fresh latest overall family")
+            app, cached = self.make_app(directory, content, marker=None)
+            fresh = paperscript.BuildInfo(
+                version="26.3",
+                build_id=2,
+                channel="STABLE",
+                download_name="paper-26.3-2.jar",
+                download_url="https://downloads.example.invalid/paper-26.3-2.jar",
+                sha256=paperscript.hashlib.sha256(content).hexdigest(),
+                size=len(content),
+                created_at="2026-08-30T02:00:00Z",
+            )
+
+            class LatestOverallAPI:
+                def get_project_versions(self, *, use_cache: bool = True) -> list[dict[str, str]]:
+                    self.versions_use_cache = use_cache
+                    return [{"id": "26.3"}, {"id": "26.2"}]
+
+                def get_latest_build(
+                    self,
+                    version: str,
+                    channel: str,
+                    *,
+                    use_cache: bool = True,
+                ) -> paperscript.BuildInfo | None:
+                    self.build_request = (version, channel, use_cache)
+                    return fresh if version == "26.3" and channel == "STABLE" else None
+
+                def download_file(
+                    self,
+                    selected: paperscript.BuildInfo,
+                    destination: Path,
+                    destination_descriptor: int | None = None,
+                ) -> paperscript.DownloadVerification:
+                    destination.write_bytes(content)
+                    return paperscript.DownloadVerification(
+                        sha256=fresh.sha256 or "",
+                        bytes_written=len(content),
+                        elapsed_seconds=0.01,
+                    )
+
+            api = LatestOverallAPI()
+            app.api = api
+            self.bind_production_revalidation(app)
+
+            app.stage_build(
+                cached,
+                selection_policy=paperscript.STAGE_SELECTION_LATEST_OVERALL,
+                required_channel="STABLE",
+            )
+
+            self.assertFalse(api.versions_use_cache)
+            self.assertEqual(api.build_request, ("26.3", "STABLE", False))
+            self.assertFalse((app.server_dir / "Paper-26.2-11.jar").exists())
+            self.assertEqual(
+                (app.server_dir / "Paper-26.3-2.jar").read_bytes(),
+                content,
+            )
+
+    def test_staging_refuses_build_missing_from_fresh_response_before_download(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            app, selected = self.make_app(
+                directory,
+                executable_jar_bytes(b"must not download"),
+                marker=None,
+            )
+
+            class MissingBuildAPI:
+                download_called = False
+
+                def get_build_by_id(
+                    self,
+                    version: str,
+                    build_id: int,
+                    *,
+                    use_cache: bool = True,
+                ) -> None:
+                    self.use_cache = use_cache
+                    return None
+
+                def download_file(self, *args: object, **kwargs: object) -> None:
+                    self.download_called = True
+                    raise AssertionError("download must not start")
+
+            api = MissingBuildAPI()
+            app.api = api
+            self.bind_production_revalidation(app)
+
+            with self.assertRaisesRegex(paperscript.PaperScriptError, "fresh Paper API response"):
+                app.stage_build(
+                    selected,
+                    selection_policy=paperscript.STAGE_SELECTION_EXACT,
+                )
+
+            self.assertFalse(api.use_cache)
+            self.assertFalse(api.download_called)
+            self.assertFalse((app.server_dir / "Paper-26.2-11.jar").exists())
+
+    def test_staging_refuses_when_fresh_api_is_unavailable_even_with_cached_metadata(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            app, selected = self.make_app(
+                directory,
+                executable_jar_bytes(b"must not download"),
+                marker=None,
+            )
+
+            class OfflineAPI:
+                download_called = False
+
+                def get_build_by_id(self, *args: object, **kwargs: object) -> None:
+                    raise paperscript.PaperScriptError("simulated Paper API outage")
+
+                def download_file(self, *args: object, **kwargs: object) -> None:
+                    self.download_called = True
+                    raise AssertionError("download must not start")
+
+            api = OfflineAPI()
+            app.api = api
+            self.bind_production_revalidation(app)
+
+            with self.assertRaisesRegex(paperscript.PaperScriptError, "simulated Paper API outage"):
+                app.stage_build(
+                    selected,
+                    selection_policy=paperscript.STAGE_SELECTION_EXACT,
+                )
+
+            self.assertFalse(api.download_called)
+            self.assertFalse((app.server_dir / "Paper-26.2-11.jar").exists())
+
+    def test_staging_refuses_fresh_channel_mismatch_before_download(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            app, selected = self.make_app(
+                directory,
+                executable_jar_bytes(b"must not download"),
+                marker=None,
+            )
+            selected.channel = "STABLE"
+            fresh = build_info(version="26.2", build_id=11, channel="BETA")
+
+            class ChangedChannelAPI:
+                def get_latest_build(self, *args: object, **kwargs: object) -> paperscript.BuildInfo:
+                    return fresh
+
+                def download_file(self, *args: object, **kwargs: object) -> None:
+                    raise AssertionError("download must not start")
+
+            app.api = ChangedChannelAPI()
+            self.bind_production_revalidation(app)
+
+            with self.assertRaisesRegex(paperscript.PaperScriptError, "while STABLE was required"):
+                app.stage_build(
+                    selected,
+                    selection_policy=paperscript.STAGE_SELECTION_LATEST_CHANNEL,
+                    required_channel="STABLE",
+                )
+
+            self.assertFalse((app.server_dir / "Paper-26.2-11.jar").exists())
+
+    def test_staging_refuses_non_https_fresh_download_url(self) -> None:
+        for unsafe_url in (
+            "http://downloads.example.invalid/paper.jar",
+            "file:///tmp/paper.jar",
+            "https://user:password@downloads.example.invalid/paper.jar",
+            "https://downloads.example.invalid/paper.jar\x1b]52;c;secret\x07",
+            "https://[malformed/paper.jar",
+        ):
+            with self.subTest(url=unsafe_url), tempfile.TemporaryDirectory() as directory:
+                app, selected = self.make_app(
+                    directory,
+                    executable_jar_bytes(b"must not download"),
+                    marker=None,
+                )
+                fresh = build_info(version="26.2", build_id=11)
+                fresh.download_url = unsafe_url
+
+                class UnsafeURLAPI:
+                    def get_build_by_id(self, *args: object, **kwargs: object) -> paperscript.BuildInfo:
+                        return fresh
+
+                    def download_file(self, *args: object, **kwargs: object) -> None:
+                        raise AssertionError("download must not start")
+
+                app.api = UnsafeURLAPI()
+                self.bind_production_revalidation(app)
+
+                with self.assertRaisesRegex(paperscript.PaperScriptError, "safe HTTPS"):
+                    app.stage_build(
+                        selected,
+                        selection_policy=paperscript.STAGE_SELECTION_EXACT,
+                    )
+
+                self.assertFalse((app.server_dir / "Paper-26.2-11.jar").exists())
 
     def test_stages_beside_active_jar_without_changing_it(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -1340,7 +2273,7 @@ class UpdateSelectionTests(unittest.TestCase):
             current_build,
         )
         target = build_info(build_id=latest_build)
-        app.latest_stable_version = lambda: ("26.2", target)
+        app.latest_stable_version = lambda **kwargs: ("26.2", target)
         app.last_launched_jar = lambda: (_ for _ in ()).throw(
             paperscript.PaperScriptError("marker unavailable")
         )
@@ -1354,11 +2287,54 @@ class UpdateSelectionTests(unittest.TestCase):
 
     def test_same_version_newer_stable_build_is_selected(self) -> None:
         app, expected = self.make_app(83, 84, allow_upgrade=True)
-        self.assertIs(app.choose_target_for_update(), expected)
+        selection = app.choose_target_for_update()
+        self.assertIsNotNone(selection)
+        self.assertIs(selection.build, expected)
+        self.assertEqual(
+            selection.staging_policy,
+            paperscript.STAGE_SELECTION_LATEST_CHANNEL,
+        )
 
     def test_same_version_upgrade_respects_disabled_config(self) -> None:
         app, _ = self.make_app(83, 84, allow_upgrade=False)
         self.assertIsNone(app.choose_target_for_update())
+
+    def test_empty_server_update_requires_fresh_latest_overall_policy(self) -> None:
+        app, expected = self.make_app(0, 84, allow_upgrade=True)
+        app.find_current_jar = lambda: None
+
+        selection = app.choose_target_for_update()
+
+        self.assertIsNotNone(selection)
+        self.assertIs(selection.build, expected)
+        self.assertEqual(
+            selection.staging_policy,
+            paperscript.STAGE_SELECTION_LATEST_OVERALL,
+        )
+
+    def test_run_update_bypasses_cache_and_passes_policy_to_shared_boundary(self) -> None:
+        app = object.__new__(paperscript.PaperScriptApp)
+        target = build_info()
+        selection = paperscript.UpdateSelection(
+            target,
+            paperscript.STAGE_SELECTION_LATEST_OVERALL,
+        )
+        app.describe_server_context = mock.Mock()
+        app.log_api_activity = mock.Mock()
+        app.choose_target_for_update = mock.Mock(return_value=selection)
+        app.stage_build = mock.Mock()
+        app.check_latest_channel_only = "STABLE"
+        app.logger = RecordingLogger()
+
+        app.run_update()
+
+        app.choose_target_for_update.assert_called_once_with(use_cache=False)
+        app.stage_build.assert_called_once_with(
+            target,
+            force_version_prompt=False,
+            selection_policy=paperscript.STAGE_SELECTION_LATEST_OVERALL,
+            required_channel="STABLE",
+        )
 
     def test_update_follows_launcher_marker_instead_of_newer_staged_family(self) -> None:
         app = object.__new__(paperscript.PaperScriptApp)
@@ -1374,11 +2350,11 @@ class UpdateSelectionTests(unittest.TestCase):
         )
         overall = build_info(version="26.3", build_id=2)
         expected = build_info(version="26.2", build_id=85)
-        app.latest_stable_version = lambda: ("26.3", overall)
+        app.latest_stable_version = lambda **kwargs: ("26.3", overall)
 
         class FakeAPI:
-            def get_latest_build(self, version: str, channel: str):
-                self.request = (version, channel)
+            def get_latest_build(self, version: str, channel: str, *, use_cache: bool = True):
+                self.request = (version, channel, use_cache)
                 return expected
 
         app.api = FakeAPI()
@@ -1389,8 +2365,13 @@ class UpdateSelectionTests(unittest.TestCase):
 
         selected = app.choose_target_for_update()
 
-        self.assertIs(selected, expected)
-        self.assertEqual(app.api.request, ("26.2", "STABLE"))
+        self.assertIsNotNone(selected)
+        self.assertIs(selected.build, expected)
+        self.assertEqual(
+            selected.staging_policy,
+            paperscript.STAGE_SELECTION_LATEST_CHANNEL,
+        )
+        self.assertEqual(app.api.request, ("26.2", "STABLE", True))
 
     def test_legacy_launcher_marker_keeps_update_on_its_version_family(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -1412,11 +2393,11 @@ class UpdateSelectionTests(unittest.TestCase):
             )
             overall = build_info(version="26.3", build_id=2)
             expected = build_info(version="26.2", build_id=85)
-            app.latest_stable_version = lambda: ("26.3", overall)
+            app.latest_stable_version = lambda **kwargs: ("26.3", overall)
 
             class FakeAPI:
-                def get_latest_build(self, version: str, channel: str):
-                    self.request = (version, channel)
+                def get_latest_build(self, version: str, channel: str, *, use_cache: bool = True):
+                    self.request = (version, channel, use_cache)
                     return expected
 
             app.api = FakeAPI()
@@ -1427,17 +2408,22 @@ class UpdateSelectionTests(unittest.TestCase):
 
             selected = app.choose_target_for_update()
 
-            self.assertIs(selected, expected)
-            self.assertEqual(app.api.request, ("26.2", "STABLE"))
+            self.assertIsNotNone(selected)
+            self.assertIs(selected.build, expected)
+            self.assertEqual(
+                selected.staging_policy,
+                paperscript.STAGE_SELECTION_LATEST_CHANNEL,
+            )
+            self.assertEqual(app.api.request, ("26.2", "STABLE", True))
 
 
 class PreviewSelectionTests(unittest.TestCase):
     def test_preview_prefers_beta_then_alpha_on_newer_versions(self) -> None:
         class FakeAPI:
-            def get_project_versions(self):
+            def get_project_versions(self, *, use_cache: bool = True):
                 return [{"id": "26.3"}, {"id": "26.2"}]
 
-            def get_latest_build(self, version: str, channel: str):
+            def get_latest_build(self, version: str, channel: str, *, use_cache: bool = True):
                 if version == "26.3" and channel == "BETA":
                     return build_info(version="26.3", build_id=7, channel="BETA")
                 if version == "26.3" and channel == "ALPHA":

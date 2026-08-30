@@ -47,10 +47,12 @@ Bash still has a place here, which is why the launcher remains a simple `papersc
 - Prompts before staging a newer or older Minecraft version family.
 - Supports forced re-download of the same build with `--force`.
 - Requires the Paper API size and SHA-256 before staging and never writes beyond the declared size.
+- Recomputes every requested latest-version/channel policy, or revalidates an explicitly requested exact build, against fresh Paper API data immediately before staging; cached metadata is never artifact authorization.
 - Preflights server-root write access, durable directory sync, and enough free space for the JAR plus a safety reserve.
 - Verifies the exact private staging inode against the API size/SHA-256 and checks its executable manifest, Main-Class bytecode, and every ZIP entry CRC.
-- Stores staged-build identity and SHA-256 in `state.json` for later `verify` checks.
-- Caches Paper API metadata locally so repeated release checks are faster.
+- Stores staged-build identity and SHA-256 in `state.json` for later fail-closed `verify` checks.
+- Caches Paper API metadata locally through an owner-checked, descriptor-bound directory and atomic private regular files so repeated read-only release checks are faster.
+- Escapes untrusted terminal controls from API, HTTP, and other dynamic text before console or log output.
 - Publishes the verified download atomically as `Paper-<version>-<build>.jar` without replacing an existing JAR.
 - Uses the launcher's atomic `last-launched-jar.txt` marker to protect the JAR selected for the last start.
 - Keeps the last-launched JAR plus the newest staged JAR in the server root by default.
@@ -264,11 +266,23 @@ Examples:
 
 ### `verify`
 
-Hashes the newest managed jar and compares it against:
+Under the per-server mutation lock, hashes the newest managed jar through a no-follow file
+descriptor and confirms that its path, inode, contents, and newest-target selection remain
+unchanged throughout verification. It compares the digest against:
 
-- the SHA-256 recorded in `state.json` during the last PaperScript stage
-- the expected SHA-256 from the live Paper API for that exact version and build
-- the recorded staging channel and current channel reported by the API
+- every non-empty SHA-256 recorded for that same jar in `state.json` during the last
+  PaperScript stage
+- a valid SHA-256 fetched from the Paper API for that exact version and build through a
+  fresh lookup that always bypasses local metadata cache contents
+- the command also reports the recorded staging channel and current channel from the API
+
+`verify` exits with status `0` only after the target remains stable and every applicable
+digest matches. It exits with status `1` when the jar is missing or changes during the
+check, recorded digest data is malformed or mismatched, the fresh API lookup fails or
+cannot find the exact build, the API omits a valid SHA-256, or the jar differs from that
+SHA-256. Optional historical state may be absent or name another jar; a matching fresh API
+digest remains authoritative. Consequently, `verify` requires Paper API connectivity and
+never treats cached metadata as sufficient verification.
 
 Examples:
 
@@ -548,7 +562,7 @@ PaperScript stores its runtime files inside the visible `paperscript/` directory
 - `paperscript/downloads/`
   Legacy/diagnostic download workspace; active staging uses one private hidden temp inode in the server root so publication stays on the same filesystem
 - `paperscript/cache/`
-  Cached Paper API metadata used to speed up repeated checks
+  Cached Paper API metadata used only to speed up discovery and read-only checks. PaperScript rejects unsafe cache directories and leaves, binds cache I/O to an opened directory descriptor, and freshly recomputes the requested staging policy.
 - `paperscript/backups/jars/<version>/`
   Bounded archive of older exact numeric Paper builds moved out of the server root
 - `paperscript/locks/`
@@ -622,7 +636,7 @@ Useful per-server settings:
 - `default_channel`
   Default download channel for `download --version`
 - `metadata_cache_enabled`
-  Enable or disable the local Paper API metadata cache
+  Enable or disable the local Paper API metadata cache. Cached metadata can influence display and preliminary selection, but fresh API data recomputes every latest-build policy and authenticates every exact-build staging operation.
 - `metadata_cache_ttl_seconds`
   How long cached metadata stays valid before PaperScript refreshes it
 - `quiet`
@@ -746,7 +760,7 @@ bash -n paperscript.sh 1MB-minecraft.sh tests/live-smoke.sh
 python3 -m py_compile paperscript/paperscript.py tests/test_paperscript.py tests/test_1mb_minecraft.py
 ```
 
-The unit suite verifies version ordering, stable-channel defaults, same-version build-upgrade behavior, preview selection, saved channel metadata, atomic state/config defaults, launcher marker publication and rollback, numeric latest-build selection, non-disruptive staging, disk/permission/durability preflight, response size caps, private-inode continuity, executable JAR/CRC validation, per-server and active-launch locking, fail-closed marker handling, symlink/version containment, dry-run pruning previews, root retention, and archive caps. Launcher tests use a disposable fake `java` executable and never start a real server.
+The unit suite verifies version ordering, stable-channel defaults, same-version build-upgrade behavior, preview selection, saved channel metadata, fresh exact-build authorization, fail-closed fresh-API verification, atomic and symlink-safe metadata caching, terminal-control neutralization, atomic state/config defaults, launcher marker publication and rollback, numeric latest-build selection, non-disruptive staging, disk/permission/durability preflight, response size caps, private-inode continuity, executable JAR/CRC validation, per-server and active-launch locking, fail-closed marker handling, symlink/version containment, dry-run pruning previews, root retention, and archive caps. Launcher tests use a disposable fake `java` executable and never start a real server.
 
 Run the opt-in live PaperMC smoke test:
 
@@ -768,11 +782,12 @@ GitHub Actions runs the network-free unit and syntax checks on current macOS and
 
 PaperScript keeps a live local todo file at [paperscript/todo.log](./paperscript/todo.log) for deferred ideas that are not implemented yet.
 
-Current completed production foundations include manual non-disruptive transactional staging, per-server locking, atomic no-overwrite publication/state, bounded JAR retention, and latest-build launcher selection with an active marker. Remaining queued ideas include:
+Current completed production foundations include manual non-disruptive transactional staging, fresh staging-policy authorization, descriptor-bound private atomic metadata-cache writes, terminal-safe dynamic output, per-server locking, atomic no-overwrite publication/state, bounded JAR retention, and latest-build launcher selection with an active marker. Remaining queued ideas include:
 
-- metadata-cache durability and corrupt-cache diagnostics
+- corrupt-cache preservation and diagnostics
 - manual review/application of the launcher diff to the canonical `1MB-minecraft.sh`
-- read-only doctor checks, actionable verification results, and machine-readable status
+- read-only doctor checks, machine-readable status, and granular documented exit codes
+- review of the Codex Security report's Security Objectives and Assumptions sections
 - broader failure-injection, CLI integration, and launcher compatibility tests
 
 Full server, world, plugin, and BlueMap backups remain a separate operational concern so
