@@ -43,7 +43,7 @@ Bash still has a place here, which is why the launcher remains a simple `papersc
   `mrfloris-PaperScript/2.0 (https://github.com/mrfdev/PaperScript)`
 - Finds the latest stable Paper version and latest stable build automatically.
 - Can inspect and stage the latest preview release that is newer than the current stable line, preferring `BETA` and falling back to `ALPHA`.
-- Stages a newer same-version stable build only when the command is run manually.
+- Stages a newer same-version build from the configured update channel (default `STABLE`) only when the command is run manually.
 - Prompts before staging a newer or older Minecraft version family.
 - Supports forced re-download of the same build with `--force`.
 - Requires the Paper API size and SHA-256 before staging and never writes beyond the declared size.
@@ -107,7 +107,7 @@ If you already run a live server and want to replace an older local PaperScript 
 
 These examples assume a central checkout. In the compact in-root layout, omit the repeated `--server-dir` option.
 
-PaperScript remains a drop-in component for server roots launched through `1MB-start.sh` and `1MB-minecraft.sh`. Replacing `paperscript.sh` and the tracked program files under `paperscript/` does not require a launcher edit, config migration, new package, or new command-line option. Preserve the server-local `paperscript/config.json`, `paperscript/state.json`, and `paperscript/last-launched-jar.txt`; the file locations, marker format, numeric JAR naming contract, and manual-start behavior are unchanged.
+PaperScript remains a drop-in component for server roots launched through `1MB-start.sh` and `1MB-minecraft.sh`. Refresh `paperscript.sh` and `paperscript/paperscript.py` together; replacing the shell launcher alone does not update the Python implementation. The tracked `paperscript/config.example.json` and `paperscript/LICENSE` can also be refreshed in place. This does not require a launcher edit, config migration, new package, or new command-line option. Preserve the server-local `paperscript/config.json`, `paperscript/state.json`, and `paperscript/last-launched-jar.txt`; the file locations, marker format, numeric JAR naming contract, and manual-start behavior are unchanged.
 
 For servers that use the required numeric naming pattern, such as `Paper-26.2-84.jar`, PaperScript detects the newest local build and stages the next verified build beside it. The updated `1MB-minecraft.sh` selects the greatest numeric build for its configured Minecraft version on the next manual start.
 
@@ -117,7 +117,7 @@ Keep your local `paperscript/config.json`, `paperscript/state.json`, and `papers
 - `check_latest_channel_only`
 - `tmux_session`
 
-then deleting the whole `paperscript/` runtime directory will also delete those per-server preferences.
+Copy the tracked source files into the existing directory. Do not replace the entire runtime directory with another server's copy or delete it: that would overwrite or discard these per-server preferences and launcher/staging records.
 
 PaperScript always stages the canonical `Paper-<version>-<numeric-build>.jar` name. Legacy names such as `Paper-26.2.jar` remain launcher fallbacks, but PaperScript never overwrites them.
 
@@ -131,13 +131,13 @@ Show the current state:
 ./paperscript.sh status
 ```
 
-Stage the latest stable Paper build for the launcher-selected Minecraft family:
+Stage the latest Paper build for the launcher-selected Minecraft family on the configured update channel (`STABLE` by default). Running `./paperscript.sh` without a command does the same thing:
 
 ```bash
 ./paperscript.sh update
 ```
 
-Force a re-download and verification of the latest stable build for that launcher family:
+Force a re-download and verification of the latest build on that update channel for the launcher family:
 
 ```bash
 ./paperscript.sh --force update
@@ -159,14 +159,16 @@ Download that preview build:
 
 ### `update`
 
-Checks the server directory, finds the latest stable build for the launcher-selected family, and stages it beside existing JARs when appropriate.
+Running `./paperscript.sh` with no command runs `update`. It checks the server directory, finds the latest build for the selected Minecraft family on `check_latest_channel_only` (`STABLE` by default), and stages it beside existing JARs when appropriate. It uses the family recorded by the launcher marker, falling back to the newest managed JAR when the marker is unavailable. Changing `default_channel` alone does not change `update`.
 
 Behavior:
 
-- If no managed Paper JAR is detected, it offers the latest stable build.
-- If the launcher-selected version has a newer stable build, it stages that build.
-- If the newest staged build for the launcher family already matches stable, `--force update` re-downloads and verifies it without replacing the existing file.
+- If no managed Paper JAR or usable launcher family is detected, it offers the latest build on the configured update channel.
+- If the launcher-selected version has a newer build on the configured update channel, it stages that build, unless `allow_same_version_build_upgrade` is disabled.
+- If the selected build is already staged, `--force update` re-downloads and verifies it without replacing the existing file.
+- If that family has no build on the configured update channel, it reports that fact and stages nothing. A beta-only family requires `check_latest_channel_only: "BETA"` to follow beta builds with bare `./paperscript.sh`.
 - `update` stays on the launcher-selected Minecraft version even when a newer family exists; cross-version staging requires an explicit `download --version ...` command.
+- Release selection uses fresh API data, including when it reports that no newer build is available.
 - Before network activity, PaperScript confirms that the server root can create a private file and durably sync directory entries. It also requires enough free space for the API-declared JAR size plus at least 64 MiB of remaining headroom (or 10% of the JAR size when that is larger).
 - The response is capped at the API-declared size. The exact on-disk inode must match that size and SHA-256, contain one executable JAR manifest and its Main-Class bytecode, and pass CRC/decompression checks for every ZIP entry.
 - The verified file is mode `0644`, fsynced, then atomically published under its numeric build filename without overwriting any path that appeared concurrently.
@@ -204,7 +206,8 @@ The normal full view can include:
 - the predicted next JAR for the family in the last launcher marker, including legacy fallback state; PaperScript does not execute or infer later edits to `_minecraftVersion`
 - stored expected SHA-256 from the last PaperScript stage
 - newest stable release
-- update status
+- newest release on the configured update channel, when that channel differs from `STABLE`
+- update status for the launcher family on the configured update channel
 - newest channels for the current stable version
 - newest preview release beyond stable
 - server-root retention and bounded archive settings
@@ -229,7 +232,7 @@ Examples:
 
 ### `stable`
 
-Shows the latest stable Paper release overall and can stage it directly.
+Shows the latest `STABLE` Paper release overall and can stage it directly. It always uses `STABLE`, regardless of `default_channel` or `check_latest_channel_only`.
 
 This is useful when you want a clear stable overview without running a full update flow first.
 
@@ -246,7 +249,7 @@ Examples:
 
 This command name is kept for compatibility, but it now behaves like a preview-channel helper.
 
-It looks for the latest non-stable Paper release that is newer than the current stable line. It prefers `BETA` and only falls back to `ALPHA` if no beta build exists.
+It looks for the latest non-stable Paper release that is newer than the current `STABLE` line. It prefers `BETA` and only falls back to `ALPHA` if no beta build exists. The stable baseline is independent of the configured update channel, so choosing beta updates does not hide the beta preview.
 
 If the current stable release is already the newest line, PaperScript says so instead of pointing you at an older beta build from that same now-stable version.
 
@@ -366,11 +369,11 @@ Notes:
 
 - `--version` downloads the newest build for that version on the selected channel.
 - `--build` downloads that exact build number for the version.
-- The default channel comes from `config.json` and defaults to `STABLE`.
+- When `--build` and `--channel` are omitted, the download channel comes from `default_channel` in `config.json`, which defaults to `STABLE`. This setting does not control bare `./paperscript.sh` or `update`.
 - Version upgrades still prompt unless you add `--yes`.
 - `--force` allows an already-selected build through the command flow, but never overwrites an existing target path.
 - PaperScript refuses same-version build downgrades because `1MB-minecraft.sh` always chooses the greatest numeric build, so an older file could not become the next launch.
-- Use `./paperscript.sh --force update` to re-download the current latest stable build.
+- Use `./paperscript.sh --force update` to re-download the current latest build on the configured update channel.
 - Use `./paperscript.sh --force download --version <version> --build <build>` to re-download one exact build.
 
 ### `cleanup`
@@ -634,11 +637,13 @@ Useful per-server settings:
 - `reconcile_server_jars_after_stage`
   Archive older matching root JARs after a successful stage, but only when launcher identity validates
 - `default_channel`
-  Default download channel for `download --version`
+  Default channel for `download --version` when neither `--channel` nor an exact `--build` is supplied. Defaults to `STABLE`.
+- `check_latest_channel_only`
+  Channel followed by bare `./paperscript.sh`, `update`, and the update comparison in `status`. Defaults to `STABLE`; use `BETA` in a server's local config to follow beta builds for that server's selected Minecraft family. The `stable` command and preview baseline remain `STABLE`.
 - `metadata_cache_enabled`
   Enable or disable the local Paper API metadata cache. Cached metadata can influence display and preliminary selection, but fresh API data recomputes every latest-build policy and authenticates every exact-build staging operation.
 - `metadata_cache_ttl_seconds`
-  How long cached metadata stays valid before PaperScript refreshes it
+  How long cached metadata stays valid before PaperScript refreshes it. Defaults to `300` seconds; update/staging checks always fetch fresh metadata.
 - `quiet`
   Suppress normal console output while retaining the activity log
 - `no_color`
@@ -661,6 +666,48 @@ Useful per-server settings:
   Delay between per-version channel lookups during `list-versions --channels`
 - `list_versions_continue_on_error`
   Continue past temporary per-version failures instead of aborting the whole listing
+
+## When The Website Shows A Newer Build
+
+On **2026-10-05**, the official [Paper 26.3 build metadata](https://fill.papermc.io/v3/projects/paper/versions/26.3/builds) reported build **152** as `BETA`. Builds **142**, **143**, and **149** were also `BETA`; `26.3` had no `STABLE` build. The latest stable release was [Paper 26.2 build 129](https://fill.papermc.io/v3/projects/paper/versions/26.2/builds). These are dated observations, not pinned versions: each run checks the API's current channel assignments.
+
+The `experimental` command is PaperScript's name for preview discovery, not a Paper API channel. Seeing build 152 on the website does not mean it has moved to `STABLE`. With the default `check_latest_channel_only: "STABLE"`, bare `./paperscript.sh` will not select a beta build for a `26.3` server.
+
+To compare the API channels and preview a specific beta update in the target server directory:
+
+```bash
+cat paperscript/config.json
+./paperscript.sh --no-metadata-cache inspect 26.3
+./paperscript.sh download --version 26.3 --channel BETA --dry-run
+```
+
+`inspect` offers a download after displaying channels; press Enter to cancel that prompt when only checking. The explicit download command selects the latest `26.3` beta without changing either channel setting. After reviewing the dry run, stage it with:
+
+```bash
+./paperscript.sh download --version 26.3 --channel BETA
+```
+
+To make future bare `./paperscript.sh` runs follow beta builds, edit the existing `paperscript/config.json` and set `check_latest_channel_only` to `"BETA"`. Optionally set `default_channel` to `"BETA"` as well if explicit `download --version ...` commands should default to beta. Preserve the other settings. Confirm the launcher marker targets `26.3`, then check the selection:
+
+```bash
+cat paperscript/last-launched-jar.txt
+./paperscript.sh update --dry-run
+```
+
+If the marker still names another family, `update` continues following that family even when a newer-family JAR has been staged. With no usable marker it falls back to the newest managed JAR. Use explicit version downloads for a reviewed family change; PaperScript never edits the launcher's configured version.
+
+Read-only release views (`status`, `stable`, `experimental`, and the display in `inspect`) can reuse metadata for **300 seconds** by default. `--no-metadata-cache` bypasses that local cache. `update`, `download`, `stable --download`, and `experimental --download` use fresh metadata for selection and staging, so an old local metadata cache cannot explain a stale update result with this implementation.
+
+The Fill API also returned HTTP cache lifetimes of **300 seconds** during the check. Bypassing PaperScript's cache does not bypass upstream caching, so short publication delays are possible; that alone does not explain remaining on a build for several days.
+
+If results still differ, confirm the server directory, local channel settings, launcher marker, and installed `paperscript/paperscript.py`, then capture fresh HTTP diagnostics:
+
+```bash
+./paperscript.sh --no-metadata-cache --debug-http inspect 26.3
+./paperscript.sh --debug-http update --dry-run
+```
+
+An older deployed copy may behave differently. The API observations above do not establish why an uninspected server previously stopped at build 142. Refresh both the shell launcher and tracked Python files as described above, preserve the target's runtime files, and compare the new dry-run output.
 
 ## Force Re-Downloading A Build
 
@@ -757,7 +804,7 @@ Run the dependency-free unit and drift checks:
 ```bash
 python3 -m unittest discover -s tests -p 'test_*.py' -v
 bash -n paperscript.sh 1MB-minecraft.sh tests/live-smoke.sh
-python3 -m py_compile paperscript/paperscript.py tests/test_paperscript.py tests/test_1mb_minecraft.py
+python3 -m py_compile paperscript/paperscript.py tests/test_*.py
 ```
 
 The unit suite verifies version ordering, stable-channel defaults, same-version build-upgrade behavior, preview selection, saved channel metadata, fresh exact-build authorization, fail-closed fresh-API verification, atomic and symlink-safe metadata caching, terminal-control neutralization, atomic state/config defaults, launcher marker publication and rollback, numeric latest-build selection, non-disruptive staging, disk/permission/durability preflight, response size caps, private-inode continuity, executable JAR/CRC validation, per-server and active-launch locking, fail-closed marker handling, symlink/version containment, dry-run pruning previews, root retention, and archive caps. Launcher tests use a disposable fake `java` executable and never start a real server.

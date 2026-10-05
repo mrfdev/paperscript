@@ -2273,7 +2273,8 @@ class UpdateSelectionTests(unittest.TestCase):
             current_build,
         )
         target = build_info(build_id=latest_build)
-        app.latest_stable_version = lambda **kwargs: ("26.2", target)
+        app.latest_update_version = lambda **kwargs: ("26.2", target)
+        app.check_latest_channel_only = "STABLE"
         app.last_launched_jar = lambda: (_ for _ in ()).throw(
             paperscript.PaperScriptError("marker unavailable")
         )
@@ -2350,7 +2351,7 @@ class UpdateSelectionTests(unittest.TestCase):
         )
         overall = build_info(version="26.3", build_id=2)
         expected = build_info(version="26.2", build_id=85)
-        app.latest_stable_version = lambda **kwargs: ("26.3", overall)
+        app.latest_update_version = lambda **kwargs: ("26.3", overall)
 
         class FakeAPI:
             def get_latest_build(self, version: str, channel: str, *, use_cache: bool = True):
@@ -2393,7 +2394,7 @@ class UpdateSelectionTests(unittest.TestCase):
             )
             overall = build_info(version="26.3", build_id=2)
             expected = build_info(version="26.2", build_id=85)
-            app.latest_stable_version = lambda **kwargs: ("26.3", overall)
+            app.latest_update_version = lambda **kwargs: ("26.3", overall)
 
             class FakeAPI:
                 def get_latest_build(self, version: str, channel: str, *, use_cache: bool = True):

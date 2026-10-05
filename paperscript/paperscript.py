@@ -30,8 +30,8 @@ from urllib.request import Request, urlopen
 
 
 APP_NAME = "PaperScript"
-APP_VERSION = "5.2.0"
-APP_BUILD = "052"
+APP_VERSION = "5.2.1"
+APP_BUILD = "053"
 APP_RELEASE = f"{APP_VERSION} build {APP_BUILD}"
 API_ROOT = "https://fill.papermc.io/v3/projects/paper"
 PROJECT_URL = "https://github.com/mrfdev/PaperScript"
@@ -2481,6 +2481,9 @@ class PaperScriptApp:
         return archived
 
     def latest_stable_version(self, *, use_cache: bool = True) -> tuple[str, BuildInfo]:
+        return self.latest_version_for_channel("STABLE", use_cache=use_cache)
+
+    def latest_update_version(self, *, use_cache: bool = True) -> tuple[str, BuildInfo]:
         return self.latest_version_for_channel(
             self.check_latest_channel_only,
             use_cache=use_cache,
@@ -2692,13 +2695,14 @@ class PaperScriptApp:
                     else JarInfo(launcher_selection.path, launcher_selection.version, -1)
                 )
                 update_basis = "launcher-marked legacy family"
-        latest_overall_version, latest_overall_build = self.latest_stable_version(
+        update_channel = self.check_latest_channel_only.lower()
+        latest_overall_version, latest_overall_build = self.latest_update_version(
             use_cache=use_cache,
         )
 
         if current is None:
             self.logger.log(
-                    f"No managed Paper jar detected. Latest stable is version {latest_overall_version} "
+                f"No managed Paper jar detected. Latest {update_channel} is version {latest_overall_version} "
                 f"build #{latest_overall_build.build_id}."
             )
             return UpdateSelection(
@@ -2718,6 +2722,12 @@ class PaperScriptApp:
                 self.logger.log(
                     f"No {self.check_latest_channel_only} build was found for the selected Minecraft version "
                     f"{current.version}; no download was performed."
+                )
+                self.log_command_hint(
+                    f"Inspect available channels with './paperscript.sh --no-metadata-cache inspect {current.version}'. "
+                    "The update channel is set by check_latest_channel_only in paperscript/config.json; "
+                    "default_channel only controls downloads without --channel.",
+                    important=True,
                 )
                 return None
             if compare_versions(latest_overall_version, current.version) > 0:
@@ -2740,7 +2750,7 @@ class PaperScriptApp:
             )
             self.logger.log(
                 f"The {update_basis} server family is {current_description}. "
-                f"Latest stable build for that version is #{latest_build.build_id}."
+                f"Latest {update_channel} build for that version is #{latest_build.build_id}."
             )
             return UpdateSelection(
                 latest_build,
@@ -2757,7 +2767,7 @@ class PaperScriptApp:
             )
         self.logger.log(
             f"The {update_basis} server family already has {current.version} build #{current.build}. "
-            "No newer stable build is available, so no download was performed."
+            f"No newer {update_channel} build is available, so no download was performed."
         )
         self.logger.log("If you want to re-check this jar anyway, run one of these:")
         self.logger.log("  ./paperscript.sh --force update")
@@ -3419,7 +3429,13 @@ class PaperScriptApp:
 
     def run_update(self) -> None:
         self.describe_server_context()
-        self.log_api_activity("Contacting Paper API for the latest stable release...")
+        self.logger.log(
+            f"Update channel: {self.check_latest_channel_only} "
+            "(check_latest_channel_only in paperscript/config.json)."
+        )
+        self.log_api_activity(
+            f"Contacting Paper API for the latest {self.check_latest_channel_only.lower()} release..."
+        )
         selection = self.choose_target_for_update(use_cache=False)
         if selection is None:
             self.logger.log("Update finished with no staging changes.")
@@ -3524,8 +3540,13 @@ class PaperScriptApp:
             )
         running = self.detect_running_server_processes()
         self.log_api_activity("Contacting Paper API for current release data...")
-        latest_version, latest_build = self.latest_stable_version()
-        latest_preview = self.latest_preview_version(latest_version)
+        stable_version, stable_build = self.latest_stable_version()
+        if self.check_latest_channel_only == "STABLE":
+            latest_version, latest_build = stable_version, stable_build
+        else:
+            latest_version, latest_build = self.latest_update_version()
+        latest_preview = self.latest_preview_version(stable_version)
+        update_channel = self.check_latest_channel_only.lower()
         tmux_available = self.tmux_session_available()
         backup_count = self.backup_file_count()
         metadata_cache_count = self.metadata_cache_file_count()
@@ -3587,6 +3608,12 @@ class PaperScriptApp:
             next_launcher_status,
         )
 
+        self.logger.kv("Update channel", self.check_latest_channel_only)
+        if self.check_latest_channel_only != "STABLE":
+            self.logger.kv(
+                "Latest stable release",
+                f"{stable_version} build #{stable_build.build_id}",
+            )
         self.logger.kv(
             f"Latest {self.check_latest_channel_only.lower()} release",
             f"{latest_version} build #{latest_build.build_id}",
@@ -3614,22 +3641,22 @@ class PaperScriptApp:
                 self.logger.kv(
                     "Update status",
                     f"launcher family {status_current.version} uses a legacy jar with an unknown build; "
-                    f"update can stage stable build #{family_latest_build.build_id}.",
+                    f"update can stage {update_channel} build #{family_latest_build.build_id}.",
                 )
                 update_relevant = True
             elif family_latest_build.build_id > status_current.build:
                 self.logger.kv(
                     "Update status",
-                    f"newer stable build available for launcher family {status_current.version} "
+                    f"newer {update_channel} build available for launcher family {status_current.version} "
                     f"({status_current.build} -> {family_latest_build.build_id}).",
                 )
                 update_relevant = True
             elif family_latest_build.build_id == status_current.build:
-                self.logger.kv("Update status", "latest stable build for the launcher family is already staged.")
+                self.logger.kv("Update status", f"latest {update_channel} build for the launcher family is already staged.")
             else:
                 self.logger.kv(
                     "Update status",
-                    "newest managed build for the launcher family is newer than the latest stable build this script found.",
+                    f"newest managed build for the launcher family is newer than the latest {update_channel} build this script found.",
                 )
 
         if status_current is not None and compare_versions(latest_version, status_current.version) > 0:
@@ -3639,18 +3666,18 @@ class PaperScriptApp:
             )
             self.log_command_hint(
                 f"After reviewing launcher/plugin compatibility, stage it explicitly with "
-                f"'./paperscript.sh download --version {latest_version} --channel STABLE'."
+                f"'./paperscript.sh download --version {latest_version} --channel {self.check_latest_channel_only}'."
             )
             update_relevant = True
         self.log_command_hint(
             "Use './paperscript.sh stable' to inspect the latest stable release, './paperscript.sh update' to stage "
-            "the newest stable build for the launcher family, or './paperscript.sh --force update' to re-check it."
+            f"the newest {update_channel} build for the launcher family, or './paperscript.sh --force update' to re-check it."
         )
         self.log_release_page(update_relevant)
 
         if self.status_show_all_channels and not compact:
-            self.logger.log(f"Latest channels for stable version {latest_version}:")
-            channels = self.latest_builds_by_channel(latest_version)
+            self.logger.log(f"Latest channels for stable version {stable_version}:")
+            channels = self.latest_builds_by_channel(stable_version)
             for channel in ["STABLE", "BETA", "ALPHA", "RECOMMENDED"]:
                 build = channels.get(channel)
                 if build:
@@ -3662,10 +3689,10 @@ class PaperScriptApp:
         if latest_preview is None:
             self.logger.kv(
                 "Latest preview release",
-                f"none newer than stable ({latest_version} build #{latest_build.build_id})",
+                f"none newer than stable ({stable_version} build #{stable_build.build_id})",
             )
             self.log_command_hint(
-                f"Use './paperscript.sh inspect {latest_version}' to browse older beta or alpha channels for the current stable line."
+                f"Use './paperscript.sh inspect {stable_version}' to browse older beta or alpha channels for the current stable line."
             )
         else:
             latest_preview_version, latest_preview_build = latest_preview
@@ -3718,7 +3745,7 @@ class PaperScriptApp:
         if build.sha256:
             self.logger.log(f"Expected SHA-256: {build.sha256}")
         self.log_command_hint(
-            f"Exact manual command: ./paperscript.sh download --version {version} --channel {self.check_latest_channel_only}"
+            f"Exact manual command: ./paperscript.sh download --version {version} --channel STABLE"
         )
         self.log_release_page(relevant=True)
         if download:
@@ -3727,7 +3754,7 @@ class PaperScriptApp:
                 force_version_prompt=True,
                 prompt_for_forced_recheck=True,
                 selection_policy=STAGE_SELECTION_LATEST_OVERALL,
-                required_channel=self.check_latest_channel_only,
+                required_channel="STABLE",
             )
 
     def run_experimental(self, download: bool = False) -> None:
@@ -4269,7 +4296,7 @@ def build_parser() -> argparse.ArgumentParser:
         description="Manually stage verified, versioned Paper server jars through the Fill v3 API.",
         epilog=(
             f"Project and examples: {PROJECT_URL}\n"
-            "Use 'update' for the latest stable build in the launcher-selected family, or "
+            "Use 'update' for the latest build in the launcher-selected family and configured channel (default STABLE), or "
             "'download --version ... --build ...' for an exact jar."
         ),
     )
@@ -4330,7 +4357,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     subparsers = parser.add_subparsers(dest="command")
 
-    subparsers.add_parser("update", help="Stage the latest stable build for the launcher-selected Paper family.")
+    subparsers.add_parser("update", help="Stage the latest build for the launcher-selected Paper family and configured channel (default STABLE).")
     status_parser = subparsers.add_parser(
         "status",
         help="Show launcher, staged-JAR, retention, and release state.",
