@@ -117,110 +117,111 @@ exit "${FAKE_JAVA_EXIT:-0}"
     def test_selects_greatest_numeric_build_for_configured_version(self) -> None:
         result = self.run_launcher(
             [
-                "paper-26.2-9.jar",
-                "PAPER-26.2-10.JAR",
-                "Paper-26.2-latest.jar",
-                "Paper-26.2-11.jar.part",
-                "Paper-26.3-999.jar",
-                "Paper-26.2.jar",
+                "paper-26.3-9.jar",
+                "PAPER-26.3-10.JAR",
+                "Paper-26.3-latest.jar",
+                "Paper-26.3-11.jar.part",
+                "Paper-26.2-999.jar",
+                "Paper-26.4-999.jar",
+                "Paper-26.3.jar",
             ]
         )
 
-        self.assertEqual(self.selected_jar(result), "PAPER-26.2-10.JAR")
-        self.assertEqual(result.marker_content, "PAPER-26.2-10.JAR")
+        self.assertEqual(self.selected_jar(result), "PAPER-26.3-10.JAR")
+        self.assertEqual(result.marker_content, "PAPER-26.3-10.JAR")
 
     def test_uses_legacy_current_version_name_when_no_build_jar_exists(self) -> None:
-        result = self.run_launcher(["paper-26.2.jar", "Paper-26.3-999.jar"])
+        result = self.run_launcher(["paper-26.3.jar", "Paper-26.2-999.jar", "Paper-26.4-999.jar"])
 
-        self.assertEqual(self.selected_jar(result), "paper-26.2.jar")
-        self.assertEqual(result.marker_content, "paper-26.2.jar")
+        self.assertEqual(self.selected_jar(result), "paper-26.3.jar")
+        self.assertEqual(result.marker_content, "paper-26.3.jar")
 
     def test_never_selects_a_build_from_another_minecraft_version(self) -> None:
-        result = self.run_launcher(["Paper-26.3-999.jar"])
+        result = self.run_launcher(["Paper-26.2-999.jar", "Paper-26.4-999.jar"])
 
         self.assertNotEqual(result.completed.returncode, 0)
         self.assertEqual(result.java_arguments, [])
         self.assertIsNone(result.marker_content)
-        self.assertIn("Paper-26.2.jar", result.completed.stderr)
+        self.assertIn("Paper-26.3.jar", result.completed.stderr)
 
     def test_replaces_an_old_marker_before_java_starts(self) -> None:
         result = self.run_launcher(
-            ["Paper-26.2-84.jar", "Paper-26.2-85.jar"],
-            existing_marker="Paper-26.2-84.jar\n",
+            ["Paper-26.3-84.jar", "Paper-26.3-85.jar"],
+            existing_marker="Paper-26.3-84.jar\n",
         )
 
-        self.assertEqual(self.selected_jar(result), "Paper-26.2-85.jar")
-        self.assertEqual(result.marker_content, "Paper-26.2-85.jar")
+        self.assertEqual(self.selected_jar(result), "Paper-26.3-85.jar")
+        self.assertEqual(result.marker_content, "Paper-26.3-85.jar")
 
     def test_uses_the_launcher_directory_instead_of_the_callers_directory(self) -> None:
         with tempfile.TemporaryDirectory() as outside:
             result = self.run_launcher(
-                ["Paper-26.2-84.jar"],
+                ["Paper-26.3-84.jar"],
                 invocation_cwd=Path(outside),
             )
 
-        self.assertEqual(self.selected_jar(result), "Paper-26.2-84.jar")
-        self.assertEqual(result.marker_content, "Paper-26.2-84.jar")
+        self.assertEqual(self.selected_jar(result), "Paper-26.3-84.jar")
+        self.assertEqual(result.marker_content, "Paper-26.3-84.jar")
 
     def test_ignores_a_higher_build_symlink(self) -> None:
         result = self.run_launcher(
-            ["Paper-26.2-84.jar"],
-            jar_symlinks={"Paper-26.2-999.jar": "Paper-26.2-84.jar"},
+            ["Paper-26.3-84.jar"],
+            jar_symlinks={"Paper-26.3-999.jar": "Paper-26.3-84.jar"},
         )
 
-        self.assertEqual(self.selected_jar(result), "Paper-26.2-84.jar")
-        self.assertEqual(result.marker_content, "Paper-26.2-84.jar")
+        self.assertEqual(self.selected_jar(result), "Paper-26.3-84.jar")
+        self.assertEqual(result.marker_content, "Paper-26.3-84.jar")
 
     def test_concurrent_launcher_is_rejected_before_marker_changes(self) -> None:
         result = self.run_launcher(
-            ["Paper-26.2-84.jar", "Paper-26.2-85.jar"],
-            existing_marker="Paper-26.2-84.jar\n",
+            ["Paper-26.3-84.jar", "Paper-26.3-85.jar"],
+            existing_marker="Paper-26.3-84.jar\n",
             active_launcher_pid=os.getpid(),
         )
 
         self.assertNotEqual(result.completed.returncode, 0)
         self.assertEqual(result.java_arguments, [])
-        self.assertEqual(result.marker_content, "Paper-26.2-84.jar")
+        self.assertEqual(result.marker_content, "Paper-26.3-84.jar")
         self.assertIn("launch lock already exists", result.completed.stderr)
 
     def test_ownerless_launcher_lock_is_never_reclaimed_automatically(self) -> None:
         result = self.run_launcher(
-            ["Paper-26.2-84.jar", "Paper-26.2-85.jar"],
-            existing_marker="Paper-26.2-84.jar\n",
+            ["Paper-26.3-84.jar", "Paper-26.3-85.jar"],
+            existing_marker="Paper-26.3-84.jar\n",
             ownerless_launcher_lock=True,
         )
 
         self.assertNotEqual(result.completed.returncode, 0)
         self.assertEqual(result.java_arguments, [])
-        self.assertEqual(result.marker_content, "Paper-26.2-84.jar")
+        self.assertEqual(result.marker_content, "Paper-26.3-84.jar")
         self.assertIn("Refusing automatic recovery", result.completed.stderr)
 
     def test_dead_wrapper_pid_lock_is_never_reclaimed_automatically(self) -> None:
         result = self.run_launcher(
-            ["Paper-26.2-84.jar", "Paper-26.2-85.jar"],
-            existing_marker="Paper-26.2-84.jar\n",
+            ["Paper-26.3-84.jar", "Paper-26.3-85.jar"],
+            existing_marker="Paper-26.3-84.jar\n",
             active_launcher_pid=99_999_999,
         )
 
         self.assertNotEqual(result.completed.returncode, 0)
         self.assertEqual(result.java_arguments, [])
-        self.assertEqual(result.marker_content, "Paper-26.2-84.jar")
+        self.assertEqual(result.marker_content, "Paper-26.3-84.jar")
         self.assertIn("Refusing automatic recovery", result.completed.stderr)
 
     def test_failed_jvm_start_restores_the_previous_launcher_marker(self) -> None:
         result = self.run_launcher(
-            ["Paper-26.2-84.jar", "Paper-26.2-85.jar"],
-            existing_marker="Paper-26.2-84.jar\n",
+            ["Paper-26.3-84.jar", "Paper-26.3-85.jar"],
+            existing_marker="Paper-26.3-84.jar\n",
             java_exit_code=1,
         )
 
         self.assertNotEqual(result.completed.returncode, 0)
-        self.assertEqual(result.marker_content, "Paper-26.2-84.jar")
+        self.assertEqual(result.marker_content, "Paper-26.3-84.jar")
         self.assertIn("Failed to start the jvm", result.completed.stderr)
 
     def test_first_failed_jvm_start_removes_its_unproven_marker(self) -> None:
         result = self.run_launcher(
-            ["Paper-26.2-85.jar"],
+            ["Paper-26.3-85.jar"],
             java_exit_code=1,
         )
 
@@ -237,9 +238,9 @@ exit "${FAKE_JAVA_EXIT:-0}"
             fake_bin.mkdir()
             runtime.mkdir()
             marker = runtime / "last-launched-jar.txt"
-            marker.write_text("Paper-26.2-84.jar\n", encoding="utf-8")
+            marker.write_text("Paper-26.3-84.jar\n", encoding="utf-8")
             for build in (84, 85):
-                (server_dir / f"Paper-26.2-{build}.jar").write_bytes(
+                (server_dir / f"Paper-26.3-{build}.jar").write_bytes(
                     f"build {build}".encode()
                 )
 
@@ -288,7 +289,7 @@ exit 1
                         if (
                             child_pid_path.exists()
                             and marker.read_text(encoding="utf-8").strip()
-                            == "Paper-26.2-85.jar"
+                            == "Paper-26.3-85.jar"
                             and rollback_marker.exists()
                         ):
                             break
@@ -318,7 +319,7 @@ exit 1
                         0,
                         cleanup.stdout + cleanup.stderr,
                     )
-                    self.assertTrue((server_dir / "Paper-26.2-84.jar").is_file())
+                    self.assertTrue((server_dir / "Paper-26.3-84.jar").is_file())
 
                     release_java.touch()
                     process.wait(timeout=5)
@@ -326,9 +327,9 @@ exit 1
                 self.assertNotEqual(process.returncode, 0)
                 self.assertEqual(
                     marker.read_text(encoding="utf-8").strip(),
-                    "Paper-26.2-84.jar",
+                    "Paper-26.3-84.jar",
                 )
-                self.assertTrue((server_dir / "Paper-26.2-84.jar").is_file())
+                self.assertTrue((server_dir / "Paper-26.3-84.jar").is_file())
                 self.assertFalse(rollback_marker.exists())
             finally:
                 if process is not None:
@@ -345,7 +346,7 @@ exit 1
             server_dir.mkdir()
             fake_bin.mkdir()
             (server_dir / "paperscript").mkdir()
-            (server_dir / "Paper-26.2-85.jar").write_bytes(b"test jar placeholder")
+            (server_dir / "Paper-26.3-85.jar").write_bytes(b"test jar placeholder")
 
             launcher = server_dir / LAUNCHER_PATH.name
             shutil.copy2(LAUNCHER_PATH, launcher)

@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 
 # @Filename: 1MB-minecraft.sh
-# @Version: 2.21.0, build 084 for Minecraft 26.2 (Java 26, 64bit)
-# @Release: August 4th, 2026
-# @Description: Helps us start a Paper 26.2 server.
+# @Version: 2.21.0, build 084 (upstream base)
+# @Release: August 4th, 2026 (upstream base)
+# @Description: Helps us start a Paper 26.3 server (Java 26, 64bit).
 # @PaperUpdate source: /Users/floris/Projects/1MB/Resources/Server/1MB-minecraft.sh
 # @PaperUpdate source SHA-256: 860d482ea706526d86f9584816c6851a41577888ce040836e9201845cb1942d1
 # @PaperUpdate test customization: Prefer the greatest numeric Paper build for the configured Minecraft version.
@@ -20,7 +20,7 @@
 #
 ###
 
-_minecraftVersion="26.2"
+_minecraftVersion="26.3"
 # Which version are we running?
 
 _minJavaVersion=26
@@ -35,7 +35,7 @@ _javaMemory="-Xms4G -Xmx4G"
 # "-Xmx2G" = maximum memory allocation pool of memory for JVM.
 # "-Xms1G" = initial memory allocation pool of memory for JVM.
 # More details here: https://stackoverflow.com/questions/14763079/
-# Example: (10GB host for dedicated Paper 26.1.x server with custom flags, using 10GB ram, etc.)
+# Example: (10GB host for dedicated Paper 26.3 server with custom flags, using 10GB ram, etc.)
 # _javaMemory="-Xms10G -Xmx10G -XX:+UseG1GC -XX:+ParallelRefProcEnabled -XX:MaxGCPauseMillis=200 -XX:+UnlockExperimentalVMOptions -XX:+DisableExplicitGC -XX:+AlwaysPreTouch -XX:G1NewSizePercent=30 -XX:G1MaxNewSizePercent=40 -XX:G1HeapRegionSize=8M -XX:G1ReservePercent=20 -XX:G1HeapWastePercent=5 -XX:G1MixedGCCountTarget=4 -XX:InitiatingHeapOccupancyPercent=15 -XX:G1MixedGCLiveThresholdPercent=90 -XX:G1RSetUpdatingPauseTimePercent=5 -XX:SurvivorRatio=32 -XX:+PerfDisableSharedMem -XX:MaxTenuringThreshold=1 -Dusing.aikars.flags=https://mcflags.emc.gs -Daikars.new.flags=true"
 # _javaMemory="-Xms10240M -Xmx10240M -XX:+UseG1GC -XX:+ParallelRefProcEnabled -XX:MaxGCPauseMillis=200 -XX:+UnlockExperimentalVMOptions -XX:+DisableExplicitGC -XX:+AlwaysPreTouch -XX:G1HeapWastePercent=5 -XX:G1MixedGCCountTarget=4 -XX:InitiatingHeapOccupancyPercent=15 -XX:G1MixedGCLiveThresholdPercent=90 -XX:G1RSetUpdatingPauseTimePercent=5 -XX:SurvivorRatio=32 -XX:+PerfDisableSharedMem -XX:MaxTenuringThreshold=1 -Dusing.aikars.flags=https://mcflags.emc.gs -Daikars.new.flags=true -XX:G1NewSizePercent=30 -XX:G1MaxNewSizePercent=40 -XX:G1HeapRegionSize=8M -XX:G1ReservePercent=20"
 # Figure out optimal flags for your configuration here: https://flags.sh/
@@ -58,9 +58,9 @@ _javaParams="-Dfile.encoding=UTF-8 -Dapple.awt.UIElement=true --sun-misc-unsafe-
 # Override auto engine jar detection; only use this if you have issues
 _engine="Paper"
 # spigot until paper jar is out
-# "" assumes auto detection for <engine>-26.1.x.jar
-# "spigot" assumes to look for spigot-26.1.x.jar
-# "paper" assumes to look for paper-26.1.x.jar
+# "" assumes auto detection for <engine>-26.3.jar
+# "spigot" assumes to look for spigot-26.3.jar
+# "paper" assumes to look for paper-26.3.jar
 
 _engineParams=""
 # Leave empty for every day running, only edit when you need this!
@@ -75,7 +75,7 @@ _engineParams=""
 # which is legally binding, and you should read it! https://account.mojang.com/documents/minecraft_eula
 _eula=false
 
-# leave "" if you want the 26.1.x server-gui
+# leave "" if you want the 26.3 server-gui
 _noGui="--nogui"
 
 ### INTERNAL CONFIGURATION

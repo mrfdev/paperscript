@@ -475,6 +475,33 @@ class ReleaseAndConfigTests(unittest.TestCase):
         self.assertNotIn("allow_cross_version_auto_upgrade", paperscript.DEFAULT_CONFIG)
         self.assertNotIn("download_filename_pattern", paperscript.DEFAULT_CONFIG)
 
+    def test_documented_launcher_defaults_match_the_bundled_launcher(self) -> None:
+        launcher = (PROJECT_ROOT / "1MB-minecraft.sh").read_text(encoding="utf-8")
+        version_match = re.search(r'^_minecraftVersion="([^"]+)"$', launcher, re.MULTILINE)
+        java_match = re.search(r'^_minJavaVersion=(\d+)$', launcher, re.MULTILINE)
+        self.assertIsNotNone(version_match)
+        self.assertIsNotNone(java_match)
+        version = version_match.group(1)
+        java = java_match.group(1)
+
+        readme = (PROJECT_ROOT / "README.md").read_text(encoding="utf-8")
+        documented_versions = re.findall(r'_minecraftVersion="([^"]+)"', readme)
+        self.assertTrue(documented_versions)
+        self.assertEqual(set(documented_versions), {version})
+        self.assertIn(f"## Paper {version} Stable Defaults", readme)
+        self.assertIn(f"selects Minecraft **{version}**", readme)
+        self.assertIn(f"with Java {java} as the launcher requirement", readme)
+
+        layout = readme.split("```text\n", 1)[1].split("\n```", 1)[0]
+        self.assertRegex(layout, rf"/anydirectory/Paper-{re.escape(version)}-\d+\.jar")
+        self.assertIn(f"/anydirectory/paperscript/backups/jars/{version}/", layout)
+
+        help_output = io.StringIO()
+        with mock.patch.object(sys, "stdout", help_output), self.assertRaises(SystemExit) as result:
+            paperscript.build_parser().parse_args(["inspect", "--help"])
+        self.assertEqual(result.exception.code, 0)
+        self.assertIn(f"for example {version} or", help_output.getvalue())
+
     def test_malformed_config_is_preserved_and_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             config_path = Path(directory) / "config.json"

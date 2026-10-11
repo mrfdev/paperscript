@@ -4497,7 +4497,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
 
     inspect_parser = subparsers.add_parser("inspect", help="Show the latest builds for one version.")
-    inspect_parser.add_argument("version", help="Minecraft version to inspect, for example 26.2 or 1.20.4")
+    inspect_parser.add_argument("version", help="Minecraft version to inspect, for example 26.3 or 1.20.4")
 
     subparsers.add_parser("explore", help="Interactively pick a version, inspect it, and optionally stage it.")
     init_parser = subparsers.add_parser(

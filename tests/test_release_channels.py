@@ -97,6 +97,12 @@ class ReleaseChannelRegressionTests(unittest.TestCase):
         self.assertIn(url, self.responses, f"Unexpected API endpoint: {url}")
         return self.responses[url]
 
+    def promote_26_3_to_stable(self) -> None:
+        self.responses[f"{paperscript.API_ROOT}/versions/26.3/builds"].extend([
+            fill_build("26.3", 175, "STABLE"),
+            fill_build("26.3", 174, "BETA"),
+        ])
+
     def run_cli(self, *command: str) -> str:
         stdout, stderr = io.StringIO(), io.StringIO()
         original_jars = {path: path.read_bytes() for path in self.server_dir.glob("*.jar")}
@@ -153,6 +159,44 @@ class ReleaseChannelRegressionTests(unittest.TestCase):
         self.assertIn("No STABLE build was found", output)
         self.assertIn("26.3", output)
         self.assertNotIn("would atomically publish", output)
+
+    def test_default_stable_update_follows_promotion_despite_cached_beta_metadata(self) -> None:
+        self.write_config(None)
+        cache_dir = self.runtime_dir / "cache"
+        cache_dir.mkdir(mode=0o700)
+        cache_path = cache_dir / "builds-26.3.json"
+        cache_path.write_text(
+            json.dumps({
+                "cached_at_epoch": self.NOW - 1,
+                "data": self.responses[f"{paperscript.API_ROOT}/versions/26.3/builds"],
+            }),
+            encoding="utf-8",
+        )
+        cache_path.chmod(0o600)
+        self.promote_26_3_to_stable()
+
+        output = self.run_cli()
+
+        self.assertIn("Update channel: STABLE", output)
+        self.assertIn("would atomically publish Paper-26.3-175.jar", output)
+        self.assertNotIn("would atomically publish Paper-26.3-174.jar", output)
+        self.assertIn(f"{paperscript.API_ROOT}/versions/26.3/builds", self.requested_urls)
+
+    def test_default_fresh_install_and_download_follow_promoted_stable_release(self) -> None:
+        self.write_config(None)
+        self.promote_26_3_to_stable()
+        self.current_jar.unlink()
+        (self.runtime_dir / paperscript.LAST_LAUNCHED_JAR_MARKER).unlink()
+
+        update_output = self.run_cli()
+        download_output = self.run_cli("download", "--version", "26.3")
+        stable_output = self.run_cli("stable")
+
+        self.assertIn("No managed Paper jar detected. Latest stable is version 26.3 build #175", update_output)
+        for output in (update_output, download_output):
+            self.assertIn("would atomically publish Paper-26.3-175.jar", output)
+            self.assertNotIn("would atomically publish Paper-26.3-174.jar", output)
+        self.assertIn("Latest stable release overall: 26.3 build #175", stable_output)
 
     def test_default_beta_update_without_managed_jar_uses_configured_channel(self) -> None:
         self.current_jar.unlink()
@@ -216,21 +260,19 @@ class ReleaseChannelRegressionTests(unittest.TestCase):
         self.assertNotIn("newer stable build available for launcher family 26.3", output)
 
     def test_beta_update_config_does_not_make_older_beta_a_preview_after_stable_catches_up(self) -> None:
-        self.responses[f"{paperscript.API_ROOT}/versions/26.3/builds"].append(
-            fill_build("26.3", 153, "STABLE")
-        )
+        self.promote_26_3_to_stable()
 
         experimental_output = self.run_cli("experimental", "--download")
         status_output = self.run_cli("status")
 
         self.assertIn("No preview release newer than the current stable release was found", experimental_output)
-        self.assertIn("Stable is 26.3 build #153", experimental_output)
+        self.assertIn("Stable is 26.3 build #175", experimental_output)
         self.assertNotIn("would atomically publish", experimental_output)
-        self.assertRegex(status_output, r"Latest stable release\s*:\s*26\.3 build #153")
-        self.assertRegex(status_output, r"Latest beta release\s*:\s*26\.3 build #152")
+        self.assertRegex(status_output, r"Latest stable release\s*:\s*26\.3 build #175")
+        self.assertRegex(status_output, r"Latest beta release\s*:\s*26\.3 build #174")
         self.assertRegex(
             status_output,
-            r"Latest preview release\s*:\s*none newer than stable \(26\.3 build #153\)",
+            r"Latest preview release\s*:\s*none newer than stable \(26\.3 build #175\)",
         )
 
 

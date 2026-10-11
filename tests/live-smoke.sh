@@ -33,9 +33,6 @@ config.update(
     {
         "server_name": "PaperScript disposable live smoke test",
         "tmux_session": "paperscript-live-smoke",
-        "default_channel": "STABLE",
-        "check_latest_channel_only": "STABLE",
-        "allow_same_version_build_upgrade": True,
         "no_color": True,
     }
 )
@@ -69,7 +66,7 @@ assert config["default_channel"] == "STABLE"
 assert config["check_latest_channel_only"] == "STABLE"
 assert config["allow_same_version_build_upgrade"] is True
 assert state["staged_channel"] == "STABLE"
-assert version_numbers >= (26, 2)
+assert version_numbers >= (26, 3)
 assert state["staged_jar"] == f"Paper-{state['staged_version']}-{state['staged_build']}.jar"
 assert jar_path.is_file()
 
