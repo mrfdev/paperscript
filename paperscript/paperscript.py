@@ -190,11 +190,15 @@ Validation and operator feedback
 - [ ] Review the Codex Security report.md Security Objectives and Assumptions sections,
       then reconcile accepted guarantees with repository documentation, tests, and deployment guidance.
 - [ ] Add offline/degraded status with stale-cache fallback, log rotation and severity/run
-      IDs, a --version option, supported-Python CI, and reproducible tagged releases with
+      IDs, a --version option, and reproducible tagged releases with
       checksummed artifacts.
 
 Tests
 
+- [x] Run dependency-free unit, documentation-drift, and syntax checks in GitHub Actions
+      on macOS and Ubuntu with the minimum supported Python 3.9.
+- [x] Add an opt-in live PaperMC smoke test that stages and verifies a stable JAR in a
+      disposable server directory without starting or stopping a server.
 - [ ] Add hermetic CLI integration tests using a local HTTP fixture and disposable server
       roots for download retries, corrupt responses/cache, checksum mismatch, and exits.
 - [ ] Add failure-injection tests for concurrent runs, signals at every staging boundary,
@@ -4303,15 +4307,15 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--server-dir", help="Target server directory. Defaults to the current directory.")
     parser.add_argument(
         "--user-agent",
-        help="Custom User-Agent header to send to the PaperMC API. Defaults to the built-in PaperScript identity.",
+        help="Custom User-Agent header; overrides PAPERSCRIPT_USER_AGENT and the user_agent config value.",
     )
     parser.add_argument(
         "--tmux-session",
-        help="tmux session name to show in read-only status. Defaults to config, PAPERSCRIPT_TMUX_SESSION, or mcserver.",
+        help="tmux session name to show in read-only status. Overrides PAPERSCRIPT_TMUX_SESSION, then config, then mcserver.",
     )
     parser.add_argument(
         "--contact",
-        help="Optional legacy contact value used to build a PaperScript/<version> (<contact>) User-Agent override.",
+        help="Legacy contact for an interactive PaperScript/<version> (<contact>) User-Agent when no full override is set.",
     )
     parser.add_argument(
         "--timeout",
@@ -4332,7 +4336,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--dry-run",
         action="store_true",
-        help="Show what PaperScript would do without downloading, moving, or pruning files.",
+        help="Preview actions without downloading, moving, or pruning JARs. Config, logging, and metadata-cache writes may still occur.",
     )
     parser.add_argument(
         "--quiet",

@@ -19,6 +19,8 @@ paperscript/locks/
 paperscript/logs.log
 paperscript/config.json
 paperscript/state.json
+paperscript/last-launched-jar.txt
+paperscript/.launcher-marker-rollback
 
 # macOS
 .DS_Store

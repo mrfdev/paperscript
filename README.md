@@ -68,8 +68,11 @@ Bash still has a place here, which is why the launcher remains a simple `papersc
 
 ## Requirements
 
+- macOS or Linux
+- Bash for the shell launchers
 - Python `3.9+`
 - `python3` available on your path
+- `lsof` and `ps` for the optional read-only running-server checks
 - `tmux` only if you want its session shown in read-only status
 
 No third-party Python packages are required.
@@ -167,14 +170,14 @@ Behavior:
 - If the launcher-selected version has a newer build on the configured update channel, it stages that build, unless `allow_same_version_build_upgrade` is disabled.
 - If the selected build is already staged, `--force update` re-downloads and verifies it without replacing the existing file.
 - If that family has no build on the configured update channel, it reports that fact and stages nothing. A beta-only family requires `check_latest_channel_only: "BETA"` to follow beta builds with bare `./paperscript.sh`.
-- `update` stays on the launcher-selected Minecraft version even when a newer family exists; cross-version staging requires an explicit `download --version ...` command.
+- `update` stays on the launcher-selected Minecraft version even when a newer family exists. To request another family, use `download --version ...`, `stable --download`, `experimental --download`, or the interactive browser. Change the launcher's `_minecraftVersion` yourself before starting that family.
 - Release selection uses fresh API data, including when it reports that no newer build is available.
-- Before network activity, PaperScript confirms that the server root can create a private file and durably sync directory entries. It also requires enough free space for the API-declared JAR size plus at least 64 MiB of remaining headroom (or 10% of the JAR size when that is larger).
+- After fetching fresh API metadata and before downloading JAR bytes, PaperScript confirms that the server root can create a private file and durably sync directory entries. It also requires enough free space for the API-declared JAR size plus at least 64 MiB of remaining headroom (or 10% of the JAR size when that is larger).
 - The response is capped at the API-declared size. The exact on-disk inode must match that size and SHA-256, contain one executable JAR manifest and its Main-Class bytecode, and pass CRC/decompression checks for every ZIP entry.
 - The verified file is mode `0644`, fsynced, then atomically published under its numeric build filename without overwriting any path that appeared concurrently.
 - PaperScript never asks to stop the server and contains no stop/kill path.
 - After staging, valid launcher identity enables bounded root cleanup; missing/invalid identity defers cleanup without guessing.
-- If `--dry-run` is used, it reports JAR/archive actions without staging, moving, or pruning JARs; normal target-local config, logging, and metadata-cache activity may still occur.
+- If `--dry-run` is used, it reports JAR/archive actions without staging, moving, or pruning JARs; normal target-local config, logging, and metadata-cache activity may still occur. Disk-space, write-access, and directory-sync preflight checks run only during an actual download.
 
 Examples:
 
@@ -249,7 +252,7 @@ Examples:
 
 This command name is kept for compatibility, but it now behaves like a preview-channel helper.
 
-It looks for the latest non-stable Paper release that is newer than the current `STABLE` line. It prefers `BETA` and only falls back to `ALPHA` if no beta build exists. The stable baseline is independent of the configured update channel, so choosing beta updates does not hide the beta preview.
+It checks versions newer than the current `STABLE` line from newest to oldest. Within each version, it prefers `BETA` and falls back to `ALPHA`; a newer alpha version can therefore take precedence over an older beta version. The stable baseline is independent of the configured update channel, so choosing beta updates does not hide the beta preview.
 
 If the current stable release is already the newest line, PaperScript says so instead of pointing you at an older beta build from that same now-stable version.
 
@@ -325,7 +328,7 @@ This is useful for questions like:
 
 ### `inspect VERSION`
 
-Shows the newest available build per channel for one specific version, then offers to download one interactively.
+Shows the newest available build per channel for one specific version, then offers to download one when standard input is an interactive terminal. With redirected input, it only displays the builds.
 
 If the selected build is already staged, PaperScript can offer a direct confirmation. An existing target is never overwritten: it is accepted only when its SHA-256 already matches PaperMC.
 
@@ -368,7 +371,7 @@ Examples:
 Notes:
 
 - `--version` downloads the newest build for that version on the selected channel.
-- `--build` downloads that exact build number for the version.
+- `--build` downloads that exact build number for the version, regardless of `--channel` or the configured default channel.
 - When `--build` and `--channel` are omitted, the download channel comes from `default_channel` in `config.json`, which defaults to `STABLE`. This setting does not control bare `./paperscript.sh` or `update`.
 - Version upgrades still prompt unless you add `--yes`.
 - `--force` allows an already-selected build through the command flow, but never overwrites an existing target path.
@@ -390,13 +393,13 @@ Targets:
 - `--downloads`
   Delete old download workspace files in `downloads/`
 - `--backups`
-  Clean legacy top-level backup items while preserving the managed `backups/jars/` archive
+  Delete all legacy top-level backup items while preserving the managed `backups/jars/` archive; `keep_backups` does not supply an implicit `--keep`
 - `--backups --keep N`
-  Keep the newest `N` backups and remove older ones
+  Keep the newest `N` backup files by modification time and remove older files. `cleanup --keep N` also selects this target.
 - `--server-jars`
   Protect the valid launcher-marked JAR, greatest numeric next-start JAR, and any in-flight launcher rollback JAR, then archive older exact numeric builds for that same version
 - `--server-jars --keep N`
-  Use `N` as the steady-state matching-root limit (minimum `2`); the default is `2`. When last-launched and newest are the same file, only one physical JAR is needed. An active launcher may temporarily add one prior rollback JAR, so the safe transient maximum is normally `3`.
+  Use `N` as the steady-state matching-root limit (minimum `2`); omitting `--keep` uses `keep_server_jars`, which defaults to `2`. With the default limit, when last-launched and newest are the same file, only one physical JAR is needed. An active launcher may temporarily add one prior rollback JAR, so the safe transient maximum is normally `3`.
 - `--server-jars --version VERSION`
   Restrict reconciliation to this version; it must agree with the launch marker target
 - `--all`
@@ -404,7 +407,7 @@ Targets:
 - `--metadata-cache`
   Delete cached Paper API metadata in `cache/`
 - `--pycache`
-  Delete Python `__pycache__/` folders
+  Delete Python `__pycache__/` folders under the target server's `paperscript/` directory
 - `--logs`
   Clear `logs.log`
 - `--json` or `--config`
@@ -417,7 +420,7 @@ Confirmation behavior:
 - `--yes` skips the prompt
 - `--dry-run` lists both root-to-archive moves and exact archive-cap prunes without removing anything
 
-`--server-jars` is fail-closed: it refuses to move anything when the launcher marker is missing, malformed, points outside the server root, identifies a symlink, or names another version. Other Minecraft versions, legacy names, partial downloads, malformed names, symlinks, plugin JARs, and unknown files are never managed.
+`--server-jars` is fail-closed: it refuses to move anything when the launcher marker is missing, malformed, points outside the server root, identifies a symlink or legacy filename, or names another version. Other Minecraft versions, legacy names, partial downloads, malformed names, symlinks, plugin JARs, and unknown files are never managed. Run `--server-jars` separately from `--backups` or `--all`; combining them is rejected.
 
 Examples:
 
@@ -466,11 +469,11 @@ Examples:
 - `--server-dir PATH`
   Use a specific server directory instead of the current directory.
 - `--contact VALUE`
-  Optional legacy contact value used to build a `PaperScript/<version> (<contact>)` User-Agent override.
+  Legacy contact value used to build a `PaperScript/<version> (<contact>)` User-Agent when standard input is an interactive terminal and no full User-Agent override is set. It falls back to `PAPERSCRIPT_CONTACT`, then the `contact` config value.
 - `--user-agent VALUE`
-  Full custom User-Agent header. If omitted, PaperScript uses the built-in default.
+  Full custom User-Agent header. Precedence is this option, `PAPERSCRIPT_USER_AGENT`, then the `user_agent` config value. Without a full override or interactive legacy contact, PaperScript uses the built-in default.
 - `--tmux-session NAME`
-  tmux session to display in read-only status. Defaults to config, `PAPERSCRIPT_TMUX_SESSION`, or `mcserver`.
+  tmux session to display in read-only status. Precedence is this option, `PAPERSCRIPT_TMUX_SESSION`, the config value, then `mcserver`.
 - `--timeout SECONDS`
   HTTP timeout in seconds. Default comes from `config.json` and is `30` unless changed.
 - `--debug-http`
@@ -488,7 +491,7 @@ Examples:
 - `--no-color`
   Disable ANSI colors in terminal output.
 
-PaperScript also accepts these global flags after the command, so both styles work:
+`--yes`, `--force`, `--dry-run`, `--quiet`, `--no-color`, `--server-dir`, `--user-agent`, `--tmux-session`, `--contact`, and `--timeout` also work after the command, so both styles below work. Put `--debug-http` and `--no-metadata-cache` before the command.
 
 ```bash
 ./paperscript.sh --yes --force stable --download
@@ -511,7 +514,7 @@ PaperScript uses this behavior:
 
 - If you pass `--server-dir`, that path is used.
 - If you run from a normal directory, the current working directory is treated as the server directory.
-- If you run the Python file from inside a directory actually named `PaperScript`, the parent directory is treated as the server directory.
+- If the current directory is the directory containing `paperscript.py` and is named `paperscript` (case-insensitive), its parent is treated as the server directory. Merely invoking a script located there from another directory does not change the target.
 
 That makes this work naturally:
 
@@ -529,11 +532,11 @@ python3 paperscript.py update
 
 ## Running Server Detection
 
-If `server.properties` exists, `status` treats the directory as a possible live server and performs read-only checks for a likely matching Java process.
+`status` performs read-only checks for a likely matching Java process, even when `server.properties` is absent.
 
-It first uses the `server-port` value from `server.properties` and looks for a Java process listening on that exact TCP port. That makes it safer on a machine that runs several Minecraft servers at once.
+With `auto_detect_server_by_port` enabled, it first uses the `server-port` value from `server.properties` (default `25565` when absent) and looks for a Java process listening on that exact TCP port. That makes it safer on a machine that runs several Minecraft servers at once.
 
-If port-based detection does not find anything, it falls back to:
+If port-based detection does not find anything and `fallback_process_detection` is enabled, it falls back to:
 
 - jar-name matching
 - command-line matching
@@ -560,6 +563,8 @@ PaperScript stores its runtime files inside the visible `paperscript/` directory
   Last staged jar information, intentionally ignored by git
 - `paperscript/last-launched-jar.txt`
   Exact basename selected by the customized `1MB-minecraft.sh`, written atomically immediately before Java starts; a nonzero JVM exit restores the previous valid marker
+- `paperscript/.launcher-marker-rollback`
+  Previous launcher marker retained while the JVM runs so a failed launch can restore it; do not remove it while a launch is in flight
 - `paperscript/logs.log`
   Activity log
 - `paperscript/downloads/`
@@ -629,7 +634,7 @@ Useful per-server settings:
 - `tmux_session`
   Session to display in read-only status
 - `keep_backups`
-  Retention for historical files in the legacy top-level `backups/` cleanup target
+  Threshold used by `status` to suggest trimming legacy backup files. To retain that many files, pass `cleanup --backups --keep N` explicitly; `cleanup --backups` alone deletes all legacy backup items.
 - `keep_server_jars`
   Steady-state exact same-version numeric JAR limit (minimum `2`): valid last-launched plus greatest numeric next-start JAR. One in-flight launcher rollback JAR may temporarily exceed it.
 - `keep_archived_jars`
@@ -738,7 +743,7 @@ If a build is already selected and you want PaperScript to re-check that request
 Inside `inspect` and `explore`, PaperScript can also offer:
 
 ```text
-Download it anyway? [y/N]
+Build Paper-26.3-175.jar is already staged. Re-check it against the Paper API? [y/N]
 ```
 
 when the selected build is already staged. An existing target is kept byte-for-byte and is only accepted when its checksum matches the Paper API.
@@ -819,11 +824,15 @@ Run the dependency-free unit and drift checks:
 
 ```bash
 python3 -m unittest discover -s tests -p 'test_*.py' -v
-bash -n paperscript.sh 1MB-minecraft.sh tests/live-smoke.sh
+bash -n paperscript.sh
+bash -n 1MB-minecraft.sh
+bash -n tests/live-smoke.sh
 python3 -m py_compile paperscript/paperscript.py tests/test_*.py
 ```
 
-The drift checks compare the documented config with the runtime defaults and tracked example config, and compare the README's launcher defaults, layout example, and CLI version example with the bundled launcher's Minecraft and Java settings. Update those references together when changing defaults; dated release observations remain historical evidence.
+Run `bash -n` separately for each script; additional filenames in a single invocation are script arguments and are not checked.
+
+The drift checks compare the documented config with the runtime defaults and tracked example config, keep `paperscript/todo.log` equal to the runtime's `TODO_TEMPLATE`, and compare the README's launcher defaults, layout example, and CLI version example with the bundled launcher's Minecraft and Java settings. Update those references together when changing defaults; dated release observations remain historical evidence.
 
 The unit suite verifies version ordering, stable-channel defaults, same-version build-upgrade behavior, preview selection, saved channel metadata, fresh exact-build authorization, fail-closed fresh-API verification, atomic and symlink-safe metadata caching, terminal-control neutralization, atomic state/config defaults, launcher marker publication and rollback, numeric latest-build selection, non-disruptive staging, disk/permission/durability preflight, response size caps, private-inode continuity, executable JAR/CRC validation, per-server and active-launch locking, fail-closed marker handling, symlink/version containment, dry-run pruning previews, root retention, and archive caps. Launcher tests use a disposable fake `java` executable and never start a real server.
 

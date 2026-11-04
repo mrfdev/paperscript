@@ -76,11 +76,15 @@ Validation and operator feedback
 - [ ] Review the Codex Security report.md Security Objectives and Assumptions sections,
       then reconcile accepted guarantees with repository documentation, tests, and deployment guidance.
 - [ ] Add offline/degraded status with stale-cache fallback, log rotation and severity/run
-      IDs, a --version option, supported-Python CI, and reproducible tagged releases with
+      IDs, a --version option, and reproducible tagged releases with
       checksummed artifacts.
 
 Tests
 
+- [x] Run dependency-free unit, documentation-drift, and syntax checks in GitHub Actions
+      on macOS and Ubuntu with the minimum supported Python 3.9.
+- [x] Add an opt-in live PaperMC smoke test that stages and verifies a stable JAR in a
+      disposable server directory without starting or stopping a server.
 - [ ] Add hermetic CLI integration tests using a local HTTP fixture and disposable server
       roots for download retries, corrupt responses/cache, checksum mismatch, and exits.
 - [ ] Add failure-injection tests for concurrent runs, signals at every staging boundary,
