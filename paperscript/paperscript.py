@@ -31,7 +31,8 @@ from urllib.request import Request, urlopen
 
 APP_NAME = "PaperScript"
 APP_VERSION = "5.2.1"
-APP_BUILD = "053"
+APP_BUILD = "054"
+APP_RELEASE_DATE = "2026-11-25"
 APP_RELEASE = f"{APP_VERSION} build {APP_BUILD}"
 API_ROOT = "https://fill.papermc.io/v3/projects/paper"
 PROJECT_URL = "https://github.com/mrfdev/PaperScript"
@@ -2138,7 +2139,7 @@ class PaperScriptApp:
         if marker.is_symlink() or not marker.is_file():
             raise PaperScriptError(
                 f"No valid launcher marker exists at {marker}. "
-                "Start the server once with the updated 1MB-minecraft.sh, then retry."
+                "Start the server once with the bundled 1MB-minecraft.sh, then retry."
             )
         try:
             if marker.stat().st_size > 512:
@@ -2188,7 +2189,7 @@ class PaperScriptApp:
             raise PaperScriptError(
                 f"Launcher marker identifies legacy jar {selection.path.name}. Root jar retention requires "
                 "a numeric Paper-<version>-<build>.jar marker and was skipped. Stage a numeric build, "
-                "then start it once with the updated 1MB-minecraft.sh."
+                "then start it once with the bundled 1MB-minecraft.sh."
             )
         return JarInfo(selection.path, selection.version, selection.build)
 
@@ -3556,7 +3557,7 @@ class PaperScriptApp:
         metadata_cache_count = self.metadata_cache_file_count()
         update_relevant = status_current is None
 
-        self.logger.kv("PaperScript version", APP_RELEASE)
+        self.logger.kv("PaperScript version", f"{APP_RELEASE} ({APP_RELEASE_DATE})")
         self.logger.kv("Server directory", str(self.server_dir))
         if not compact:
             self.logger.kv("Runtime directory", str(self.runtime_dir))
@@ -3597,7 +3598,7 @@ class PaperScriptApp:
         else:
             self.logger.kv("Newest managed jar", "none")
         if launcher_selection is None:
-            launcher_status = "unknown; run the updated 1MB-minecraft.sh once"
+            launcher_status = "unknown. Start the server with the bundled 1MB-minecraft.sh to record it"
             if launcher_marker_error and not compact:
                 launcher_status += f" ({launcher_marker_error})"
         elif launcher_selection.build is None:
@@ -4297,7 +4298,10 @@ class PaperScriptApp:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="paperscript.sh",
-        description="Manually stage verified, versioned Paper server jars through the Fill v3 API.",
+        description=(
+            f"{APP_NAME} {APP_RELEASE} ({APP_RELEASE_DATE}). "
+            "Stage verified Paper server JARs on demand through the PaperMC Downloads Service."
+        ),
         epilog=(
             f"Project and examples: {PROJECT_URL}\n"
             "Use 'update' for the latest build in the launcher-selected family and configured channel (default STABLE), or "

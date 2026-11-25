@@ -1,13 +1,15 @@
 # PaperScript
 
-PaperScript is a dependency-free, manually invoked Paper JAR staging tool that uses the current PaperMC Fill v3 downloads service. It downloads a verified, versioned JAR beside the one already in use; it never stops, starts, restarts, or signals the server.
+**PaperScript 5.2.1 build 054 · 2026-11-25**
+
+PaperScript uses the PaperMC Fill v3 downloads service to stage Paper JARs on demand. It verifies each download and publishes the versioned JAR beside the one already in use. Start, stop, and restart the server through your usual workflow.
 
 It is designed for the layout where your server root stays readable, while PaperScript keeps its own files in a visible `paperscript/` directory:
 
 ```text
 /anydirectory/
 /anydirectory/server.properties
-/anydirectory/Paper-26.3-175.jar
+/anydirectory/Paper-26.3-262.jar
 /anydirectory/paperscript.sh
 /anydirectory/paperscript/
 /anydirectory/paperscript/paperscript.py
@@ -112,7 +114,7 @@ These examples assume a central checkout. In the compact in-root layout, omit th
 
 PaperScript remains a drop-in component for server roots launched through `1MB-start.sh` and `1MB-minecraft.sh`. Refresh `paperscript.sh` and `paperscript/paperscript.py` together; replacing the shell launcher alone does not update the Python implementation. The tracked `paperscript/config.example.json` and `paperscript/LICENSE` can also be refreshed in place. This does not require a launcher edit, config migration, new package, or new command-line option. Preserve the server-local `paperscript/config.json`, `paperscript/state.json`, and `paperscript/last-launched-jar.txt`; the file locations, marker format, numeric JAR naming contract, and manual-start behavior are unchanged.
 
-For servers that use the required numeric naming pattern, such as `Paper-26.3-175.jar`, PaperScript detects the newest local build and stages the next verified build beside it. The updated `1MB-minecraft.sh` selects the greatest numeric build for its configured Minecraft version on the next manual start.
+For servers that use numeric filenames such as `Paper-26.3-262.jar`, PaperScript detects the newest local build and stages the latest eligible build beside it. The bundled `1MB-minecraft.sh` selects the greatest numeric build for its configured Minecraft version on the next manual start.
 
 Keep your local `paperscript/config.json`, `paperscript/state.json`, and `paperscript/last-launched-jar.txt` when refreshing the checkout. In particular, review changes to:
 
@@ -124,7 +126,7 @@ Copy the tracked source files into the existing directory. Do not replace the en
 
 PaperScript always stages the canonical `Paper-<version>-<numeric-build>.jar` name. Legacy names such as `Paper-26.3.jar` remain launcher fallbacks, but PaperScript never overwrites them.
 
-If you intentionally want a fresh runtime, start once with the updated `1MB-minecraft.sh` before root-JAR cleanup. Until a valid marker exists, staging succeeds but automatic root cleanup is deliberately deferred.
+If you intentionally want a fresh runtime, start once with the bundled `1MB-minecraft.sh` before root-JAR cleanup. Until a valid marker exists, staging succeeds but automatic root cleanup is deliberately deferred.
 
 ## Quick Start
 
@@ -159,6 +161,8 @@ Download that preview build:
 ```
 
 ## Commands
+
+Run `./paperscript.sh --help` to see the installed release, its date, and the available commands.
 
 ### `update`
 
@@ -196,7 +200,7 @@ Shows PaperScript, launcher, staged-JAR, retention, and release state, including
 
 The normal full view can include:
 
-- PaperScript release
+- PaperScript version, build number, and release date
 - server directory and runtime directory
 - server label
 - tmux session name and whether it currently exists
@@ -310,21 +314,9 @@ Examples:
 ./paperscript.sh --debug-http list-versions --channels --limit 10
 ```
 
-With `--channels`, PaperScript also shows the newest build it can find per channel for each version.
+With `--channels`, PaperScript shows the newest available build per channel for each version. It retries transient API and Cloudflare errors and continues past temporary per-version failures by default. Use `--limit` to query fewer versions or `--channel-delay-ms` to slow the request rate.
 
-Because `--channels` performs many API requests, PaperScript now:
-
-- retries transient API and Cloudflare errors
-- continues past temporary per-version failures by default
-- supports `--limit` for smaller debug runs
-- supports `--channel-delay-ms` to slow the request rate when needed
-
-This is useful for questions like:
-
-- which versions exist at all
-- whether a future `26.4` line only exists as alpha or beta
-- whether `26.3` is still the newest stable family or a newer preview line has appeared
-- whether older versions such as `1.20.4` or `1.19.2` still have builds available
+Use this view to see which versions have stable builds, whether a newer version has alpha or beta builds, and whether older versions such as `1.20.4` or `1.19.2` still have builds available.
 
 ### `inspect VERSION`
 
@@ -362,10 +354,10 @@ Examples:
 ./paperscript.sh download --version 26.3
 ./paperscript.sh download --version 1.20.4
 ./paperscript.sh download --version 1.20.4 --build 123
-./paperscript.sh download --version 26.3 --channel BETA
+./paperscript.sh download --version 26.3 --channel STABLE
 ./paperscript.sh --force download --version 26.3
-./paperscript.sh --force download --version 26.3 --build 175
-./paperscript.sh download --version 26.3 --build 175 --force --yes
+./paperscript.sh --force download --version 26.3 --build 262
+./paperscript.sh download --version 26.3 --build 262 --force --yes
 ```
 
 Notes:
@@ -674,7 +666,9 @@ Useful per-server settings:
 
 ## Paper 26.3 Stable Defaults
 
-The bundled `1MB-minecraft.sh` now selects Minecraft **26.3**. Both `default_channel` and `check_latest_channel_only` default to `STABLE`. On **2026-10-11**, the official [Paper 26.3 build metadata](https://fill.papermc.io/v3/projects/paper/versions/26.3/builds) reported build **175** as `STABLE`, with build **174** still marked `BETA`. These are dated observations, not pinned build numbers: PaperScript selects builds using the API's current channel assignments.
+The bundled `1MB-minecraft.sh` selects Minecraft **26.3**. Both `default_channel` and `check_latest_channel_only` default to `STABLE`. PaperScript discovers the latest eligible build from the Downloads Service.
+
+On **2026-11-25**, Paper **26.3 build 262** was the latest `STABLE` build. The exact-build examples for 26.3 use that release. [PaperMC 26.3 build metadata](https://fill.papermc.io/v3/projects/paper/versions/26.3/builds)
 
 Existing per-server config is preserved. If you previously opted into beta builds, edit only these settings in `paperscript/config.json` to follow stable releases again:
 
@@ -704,7 +698,7 @@ For an existing 26.2 or older server, review plugin compatibility and backups, s
 
 `update` follows the family in `paperscript/last-launched-jar.txt`. The launcher writes the newly selected JAR to that marker immediately before invoking Java and restores the previous marker if Java exits with an error. With no usable marker, `update` falls back to the newest managed JAR. PaperScript never edits the launcher's configured version or migrates an existing server to a different family automatically.
 
-The `experimental` command only shows preview releases newer than the stable version. Historical 26.3 beta builds are no longer a preview once 26.3 is stable.
+Use `experimental` to look for previews on versions newer than the stable release. Use `inspect 26.3` to see the available channels for 26.3.
 
 ## When The Website Shows A Newer Build
 
@@ -736,14 +730,14 @@ If a build is already selected and you want PaperScript to re-check that request
 ./paperscript.sh --force update
 ./paperscript.sh --force stable --download
 ./paperscript.sh --force experimental --download
-./paperscript.sh --force download --version 26.3 --build 175
+./paperscript.sh --force download --version 26.3 --build 262
 ./paperscript.sh stable --download --yes --force
 ```
 
 Inside `inspect` and `explore`, PaperScript can also offer:
 
 ```text
-Build Paper-26.3-175.jar is already staged. Re-check it against the Paper API? [y/N]
+Build Paper-26.3-262.jar is already staged. Re-check it against the Paper API? [y/N]
 ```
 
 when the selected build is already staged. An existing target is kept byte-for-byte and is only accepted when its checksum matches the Paper API.

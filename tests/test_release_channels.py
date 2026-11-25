@@ -254,6 +254,8 @@ class ReleaseChannelRegressionTests(unittest.TestCase):
     def test_status_with_beta_update_config_keeps_actual_stable_and_preview_distinct(self) -> None:
         output = self.run_cli("status")
 
+        release = f"{paperscript.APP_RELEASE} ({paperscript.APP_RELEASE_DATE})"
+        self.assertIn(release, output)
         self.assertRegex(output, r"Latest stable release\s*:\s*26\.2 build #129")
         self.assertRegex(output, r"Latest preview release\s*:\s*26\.3 build #152 \(BETA\)")
         self.assertRegex(output, r"Latest beta release\s*:\s*26\.3 build #152")

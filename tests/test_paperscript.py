@@ -445,6 +445,7 @@ class ReleaseAndConfigTests(unittest.TestCase):
     def test_release_metadata_format(self) -> None:
         self.assertRegex(paperscript.APP_VERSION, r"^\d+\.\d+\.\d+$")
         self.assertRegex(paperscript.APP_BUILD, r"^\d{3}$")
+        self.assertRegex(paperscript.APP_RELEASE_DATE, r"^\d{4}-\d{2}-\d{2}$")
         self.assertEqual(
             paperscript.APP_RELEASE,
             f"{paperscript.APP_VERSION} build {paperscript.APP_BUILD}",
@@ -452,6 +453,11 @@ class ReleaseAndConfigTests(unittest.TestCase):
         self.assertEqual(
             paperscript.DEFAULT_USER_AGENT,
             "mrfloris-PaperScript/2.0 (https://github.com/mrfdev/PaperScript)",
+        )
+        readme = (PROJECT_ROOT / "README.md").read_text(encoding="utf-8")
+        self.assertIn(
+            f"**PaperScript {paperscript.APP_RELEASE} · {paperscript.APP_RELEASE_DATE}**",
+            readme,
         )
 
     def test_tracked_and_documented_config_match_runtime_defaults(self) -> None:
